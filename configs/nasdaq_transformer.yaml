@@ -1,0 +1,58 @@
+# # code/configs/nasdaq_transformer.yaml
+# # Features include microstructure + adaptive MAs (DEMA/TEMA/HMA/KAMA), TRIX, GARCH.
+
+# model_type: transformer
+
+# data:
+#   train_file: src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_20ms_train.parquet
+#   val_file:   src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_20ms_val.parquet
+#   test_file:  src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_20ms_test.parquet
+#   label_col:  y
+#   # time_col defaults to 'timestamp' if present in frames
+
+# model:
+#   seq_length: 50          # 1.0 s history on a 20 ms grid (50 bars)
+#   d_model:     64
+#   num_heads:    4
+#   num_layers:   2
+#   ff_dim:     128
+#   dropout_rate: 0.1
+
+# training:
+#   epochs:        100
+#   batch_size:    512
+#   learning_rate: 0.0005
+#   patience:      100
+#   class_weight:  true
+#   output_model_file:  results/models/nasdaq_tf.keras
+#   output_scaler_file: results/scalers/nasdaq.json
+
+
+# code/configs/nasdaq_transformer.yaml
+# Features include microstructure + adaptive MAs (DEMA/TEMA/HMA/KAMA), TRIX, GARCH.
+
+model_type: transformer
+
+data:
+  train_file: src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_train.parquet
+  val_file:   src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_val.parquet
+  test_file:  src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_test.parquet
+  label_col:  y
+  # time_col defaults to 'timestamp' if present in frames
+
+model:
+  seq_length: 100         # 2.0 s history on a 20 ms grid (100 bars)
+  d_model:     64
+  num_heads:    4
+  num_layers:   2
+  ff_dim:     128
+  dropout_rate: 0.1
+
+training:
+  epochs:        100
+  batch_size:    512
+  learning_rate: 0.0005
+  patience:      100         # let it actually run 100 epochs unless badly overfitting
+  class_weight:  true
+  output_model_file:  results/models/nasdaq_tf.keras
+  output_scaler_file: results/scalers/nasdaq.json

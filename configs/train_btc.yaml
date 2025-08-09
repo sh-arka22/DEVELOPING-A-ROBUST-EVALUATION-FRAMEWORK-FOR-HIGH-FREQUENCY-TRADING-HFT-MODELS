@@ -1,0 +1,11 @@
+# config/train_btc.yaml
+
+dataset_yaml: config/dataset_crypto.yaml
+splits_json:  config/splits.json
+
+batch_size:  256
+max_epochs:  30
+patience:    5        # early‑stopping patience
+checkpoint_dir: checkpoints/BTC_1sec
+n_trials:    50       # Optuna trials
+
