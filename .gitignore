@@ -1,10 +1,29 @@
 # Data directories
-
+src/data/raw/
 
 # Data files
 *.parquet
 *.h5
-*.csv# Large dataset files
-src/data/raw/FI2010/BenchmarkDatasets/**/*.txt
-src/data/raw/*
+*.csv
 *.txt
+
+# Large dataset files - FI2010
+src/data/raw/FI2010/BenchmarkDatasets/**/*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.venv/
+env/
+venv/
+
+# IDE files
+.vscode/
+.idea/
