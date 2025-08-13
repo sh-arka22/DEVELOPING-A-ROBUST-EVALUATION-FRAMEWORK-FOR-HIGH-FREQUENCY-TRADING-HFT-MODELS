@@ -1,0 +1,7 @@
+{
+  "nasdaq_itch_AAPL": [
+    "/Users/arkajyotisaha/Desktop/My-Thesis/code/src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_train.parquet",
+    "/Users/arkajyotisaha/Desktop/My-Thesis/code/src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_val.parquet",
+    "/Users/arkajyotisaha/Desktop/My-Thesis/code/src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_test.parquet"
+  ]
+}

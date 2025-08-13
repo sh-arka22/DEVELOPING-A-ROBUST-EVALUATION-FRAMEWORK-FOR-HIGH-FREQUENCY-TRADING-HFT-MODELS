@@ -31,6 +31,38 @@
 # code/configs/nasdaq_transformer.yaml
 # Features include microstructure + adaptive MAs (DEMA/TEMA/HMA/KAMA), TRIX, GARCH.
 
+# model_type: transformer
+
+# data:
+#   train_file: src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_train.parquet
+#   val_file:   src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_val.parquet
+#   test_file:  src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_test.parquet
+#   label_col:  y
+#   # time_col defaults to 'timestamp' if present in frames
+
+# model:
+#   seq_length: 100         #  1.0 s history on a 10 ms grid (100 bars)
+#   d_model:     64
+#   num_heads:    4
+#   num_layers:   2
+#   ff_dim:     128
+#   dropout_rate: 0.1
+
+# training:
+#   class_weight: true
+#   use_focal_loss: false      # ← disable to avoid early collapse
+#   focal_gamma: 2.0
+#   label_smoothing: 0.02
+#   use_reduce_lr: true
+#   max_class_weight: 5.0      # ← cap inverse-freq weights
+#   learning_rate: 5e-4
+#   epochs: 100
+#   batch_size: 128
+#   patience: 40               # ← train longer so it can escape collapse
+#   output_model_file:  results/models/nasdaq_tf.keras
+#   output_scaler_file: results/scalers/nasdaq.json
+
+
 model_type: transformer
 
 data:
@@ -38,21 +70,69 @@ data:
   val_file:   src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_val.parquet
   test_file:  src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_test.parquet
   label_col:  y
-  # time_col defaults to 'timestamp' if present in frames
+# data:
+#   train_file: src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_train_v2.parquet
+#   val_file:   src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_val_v2.parquet
+#   test_file:  src/data/processed/NASDAQ_ITCH/nasdaq_AAPL_10ms_test_v2.parquet
+#   label_col: y
+#   time_col: timestamp
 
 model:
-  seq_length: 100         # 2.0 s history on a 20 ms grid (100 bars)
+  seq_length: 100
   d_model:     64
   num_heads:    4
   num_layers:   2
   ff_dim:     128
   dropout_rate: 0.1
 
+# training:
+#   # imbalance controls
+#   class_weight: true
+#   max_class_weight: 5.0     # ← cap (reduce if still unstable)
+#   min_class_weight: 1.0
+#   class_weight_power: 1.0
+
+#   # loss controls
+#   use_focal_loss: false     # ← disable focal for stability first
+#   focal_gamma: 2.0
+#   label_smoothing: 0.0
+
+#   # optimization
+#   learning_rate: 5e-4
+#   use_reduce_lr: true
+#   epochs: 120
+#   batch_size: 128
+#   patience: 40              # ← give it time to escape collapse
+
+#   # checkpointing on validation accuracy
+#   monitor: val_accuracy
+#   output_model_file:  results/models/nasdaq_tf.keras
+#   output_scaler_file: results/scalers/nasdaq.json
 training:
-  epochs:        100
-  batch_size:    512
-  learning_rate: 0.0005
-  patience:      100         # let it actually run 100 epochs unless badly overfitting
-  class_weight:  true
+  # imbalance
+  class_weight: true
+  max_class_weight: 5.0   # cap
+  min_class_weight: 1.0   # floor
+  class_weight_power: 1.0 # exponent
+
+  # loss
+  use_focal_loss: false
+  focal_gamma: 2.0
+  label_smoothing: 0.0
+
+  # optimization
+  learning_rate: 5e-4
+  use_reduce_lr: true
+  epochs: 120
+  batch_size: 128
+  patience: 40
+  monitor: val_accuracy  # or 'val_loss'
+
   output_model_file:  results/models/nasdaq_tf.keras
   output_scaler_file: results/scalers/nasdaq.json
+
+
+
+
+
+  

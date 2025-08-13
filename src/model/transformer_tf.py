@@ -54,7 +54,8 @@
 
 
 """
-Transformer helpers – V2 (Lambda‑free pooling).
+Transformer helpers – V3 (class-weight friendly, stable, no Lambda).
+Adds: optional dropout stack and configurable norm-eps.
 """
 from __future__ import annotations
 import tensorflow as tf
@@ -79,6 +80,7 @@ def create_transformer_model(
     n_layers: int  = 2,
     ff_dim: int    = 128,
     dropout: float = 0.1,
+    norm_eps: float = 1e-6,
 ) -> tf.keras.Model:
     assert d_model % n_heads == 0, "d_model must be divisible by num_heads"
     inp = layers.Input(shape=(seq_len, n_numeric), dtype="float32", name="num")
@@ -89,16 +91,20 @@ def create_transformer_model(
     if dropout: x = layers.Dropout(dropout)(x)
 
     for i in range(n_layers):
-        attn = layers.MultiHeadAttention(n_heads, key_dim=d_model // n_heads,
-                                         dropout=dropout, name=f"mha_{i}")(x, x)
-        x = layers.LayerNormalization(epsilon=1e-6)(x + attn)
-        ffn = layers.Dense(ff_dim, activation="relu")(x)
-        if dropout: ffn = layers.Dropout(dropout)(ffn)
-        ffn = layers.Dense(d_model)(ffn)
-        x = layers.LayerNormalization(epsilon=1e-6)(x + ffn)
+        attn = layers.MultiHeadAttention(
+            n_heads, key_dim=d_model // n_heads, dropout=dropout, name=f"mha_{i}"
+        )(x, x)
+        x = layers.LayerNormalization(epsilon=norm_eps, name=f"ln_attn_{i}")(x + attn)
+        ffn = layers.Dense(ff_dim, activation="relu", name=f"ffn1_{i}")(x)
+        if dropout: ffn = layers.Dropout(dropout, name=f"drop_ffn_{i}")(ffn)
+        ffn = layers.Dense(d_model, name=f"ffn2_{i}")(ffn)
+        x = layers.LayerNormalization(epsilon=norm_eps, name=f"ln_ffn_{i}")(x + ffn)
 
+    # simple CLS surrogate via average pooling
     x = layers.GlobalAveragePooling1D(name="gap")(x)
-    out = layers.Dense(n_classes, activation="softmax")(x)
+    if dropout: x = layers.Dropout(dropout, name="head_drop")(x)
+    logits = layers.Dense(n_classes, name="logits")(x)
+    out = layers.Softmax(name="softmax")(logits)
 
     model = models.Model(inp, out, name="TransformerTF")
     model.compile(optimizer=tf.keras.optimizers.Adam(),

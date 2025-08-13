@@ -1,7 +1,5 @@
 # Data directories
-data/
-src/data/
-**/data/
+
 
 # Data files
 *.parquet
