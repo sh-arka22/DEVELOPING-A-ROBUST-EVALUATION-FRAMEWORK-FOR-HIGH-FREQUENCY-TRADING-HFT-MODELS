@@ -4,4 +4,7 @@
 # Data files
 *.parquet
 *.h5
-*.csv
+*.csv# Large dataset files
+src/data/raw/FI2010/BenchmarkDatasets/**/*.txt
+src/data/raw/*
+*.txt
