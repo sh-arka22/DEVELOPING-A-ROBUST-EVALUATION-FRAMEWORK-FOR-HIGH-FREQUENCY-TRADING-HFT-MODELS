@@ -99,7 +99,7 @@ model:
   num_heads: 4
   num_layers: 2
   ff_dim: 128
-  dropout_rate: 0.1
+  dropout_rate: 0.01
 
   # (optional) conv stem before Transformer (legacy options)
   conv_layers: 1
@@ -110,7 +110,7 @@ model:
   conv_activation: relu
 
   # NEW: conv head on top of Transformer
-  conv_head_layers: 3              # e.g., 3 residual/dilated blocks
+  conv_head_layers: 3            # e.g., 3 residual/dilated blocks
   conv_head_filters: 64
   conv_head_kernel: 5
   conv_head_dilations: [1, 2, 4]   # or omit to auto-use [1,2,4]
@@ -161,12 +161,12 @@ model:
 training:
   # imbalance
   class_weight: true
-  max_class_weight: 3.0   # cap
+  max_class_weight: 4.0   # cap
   min_class_weight: 1.0   # floor
-  class_weight_power: 0.5 # exponent
+  class_weight_power: 0.01 # exponent
 
   # loss
-  use_focal_loss: false
+  use_focal_loss: true
   focal_gamma: 2.0
   label_smoothing: 0.02
 
@@ -176,8 +176,8 @@ training:
   epochs: 10
   batch_size: 128
   patience: 40
-  # monitor: val_accuracy
-  monitor: 'val_loss'
+  monitor: val_accuracy
+  # monitor: 'val_loss'
 
   output_model_file:  results/models/nasdaq_tf.keras
   output_scaler_file: results/scalers/nasdaq.json
