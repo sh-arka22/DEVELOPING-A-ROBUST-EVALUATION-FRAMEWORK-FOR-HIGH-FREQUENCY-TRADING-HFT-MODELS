@@ -4,32 +4,20 @@
   "cost_bps": 0.5,
   "slip_bps": 0.0,
   "mode": "threshold",
-  "neutral_p": 0.45,
-  "long_p": 0.4,
-  "short_p": 0.4,
-  "diagnostics": {
-    "share_nonzero_future_returns": 0.002881844380403458,
-    "share_neutral_positions": 0.9610951008645533,
-    "flip_rate_per_bar": 0.0004803073967339097,
-    "flips": 2,
-    "median_abs_return_nonzero": 1.7205337096815043e-05,
-    "bars": 4164
-  },
+  "neutral_p": 0.4,
+  "long_p": 0.55,
+  "short_p": 0.55,
   "metrics_freq": "1s",
   "Sharpe": 0.0,
-  "Sortino": -2428.3327613817673,
+  "Sortino": 0.0,
   "MaxDrawdown": 0.0,
-  "VaR95": -6.558701054792948e-05,
-  "ES95": -6.558701054792948e-05,
-  "VaR99": -6.558701054792948e-05,
-  "ES99": -6.558701054792948e-05,
-  "bar_metrics": {
-    "Sharpe": -330.0387948658657,
-    "Sortino": -7.649640710631808,
-    "MaxDrawdown": -5.000000000004949e-05,
-    "VaR95": 0.0,
-    "ES95": -2.402691013935608e-08,
-    "VaR99": 0.0,
-    "ES99": -2.402691013935608e-08
+  "VaR95": 0.0,
+  "ES95": 0.0,
+  "VaR99": 0.0,
+  "ES99": 0.0,
+  "diagnostics": {
+    "flat_fraction": 1.0,
+    "avg_position_change": 0.0,
+    "bars": 4164
   }
 }

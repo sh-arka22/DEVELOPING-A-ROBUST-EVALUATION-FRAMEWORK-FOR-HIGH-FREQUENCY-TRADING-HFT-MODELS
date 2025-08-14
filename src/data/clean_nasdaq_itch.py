@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-# ─────────────────────────────────────────────────────────────────────────────
-# src/data/clean_nasdaq_itch.py – HFT‑grade ITCH replay → instrument snapshots
-#
-# Writes:  src/data/processed/NASDAQ_ITCH/mid_{SYMBOL|locate}_{snap_ms}ms.parquet
-# Sidecar: src/data/processed/NASDAQ_ITCH/mid_{...}_{snap_ms}ms_meta.json
-#
-# Snapshots include L1–L5 px/sz, midpoint, micro‑price, spread, imbalance,
-# last trade px/sz, cumulative executed volume, and (optionally) shape features:
-#   tot_bid5, tot_ask5, qimb5, b_slope, a_slope, bq_share, aq_share
-# ─────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
 import argparse

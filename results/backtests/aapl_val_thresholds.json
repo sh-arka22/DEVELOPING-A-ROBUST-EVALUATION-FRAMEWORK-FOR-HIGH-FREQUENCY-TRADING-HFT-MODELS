@@ -1,0 +1,73 @@
+{
+  "objective": "sharpe",
+  "mode": "threshold",
+  "best": {
+    "neutral_p": 0.4,
+    "long_p": 0.55,
+    "short_p": 0.55,
+    "score": 0.0,
+    "Sharpe_1s": 0.0,
+    "Sortino_1s": 0.0,
+    "MDD_1s": 0.0,
+    "VaR95_1s": 0.0,
+    "ES95_1s": 0.0
+  },
+  "top5": [
+    {
+      "neutral_p": 0.4,
+      "long_p": 0.55,
+      "short_p": 0.55,
+      "score": 0.0,
+      "Sharpe_1s": 0.0,
+      "Sortino_1s": 0.0,
+      "MDD_1s": 0.0,
+      "VaR95_1s": 0.0,
+      "ES95_1s": 0.0
+    },
+    {
+      "neutral_p": 0.4,
+      "long_p": 0.55,
+      "short_p": 0.57,
+      "score": 0.0,
+      "Sharpe_1s": 0.0,
+      "Sortino_1s": 0.0,
+      "MDD_1s": 0.0,
+      "VaR95_1s": 0.0,
+      "ES95_1s": 0.0
+    },
+    {
+      "neutral_p": 0.4,
+      "long_p": 0.55,
+      "short_p": 0.59,
+      "score": 0.0,
+      "Sharpe_1s": 0.0,
+      "Sortino_1s": 0.0,
+      "MDD_1s": 0.0,
+      "VaR95_1s": 0.0,
+      "ES95_1s": 0.0
+    },
+    {
+      "neutral_p": 0.4,
+      "long_p": 0.55,
+      "short_p": 0.61,
+      "score": 0.0,
+      "Sharpe_1s": 0.0,
+      "Sortino_1s": 0.0,
+      "MDD_1s": 0.0,
+      "VaR95_1s": 0.0,
+      "ES95_1s": 0.0
+    },
+    {
+      "neutral_p": 0.4,
+      "long_p": 0.55,
+      "short_p": 0.63,
+      "score": 0.0,
+      "Sharpe_1s": 0.0,
+      "Sortino_1s": 0.0,
+      "MDD_1s": 0.0,
+      "VaR95_1s": 0.0,
+      "ES95_1s": 0.0
+    }
+  ],
+  "searched": 1331
+}

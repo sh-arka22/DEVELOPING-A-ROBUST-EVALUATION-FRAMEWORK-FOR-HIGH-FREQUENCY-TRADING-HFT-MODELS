@@ -1,3 +1,4 @@
+# filepath: /Users/arkajyotisaha/Desktop/My-Thesis/code/src/evaluation/report.py -->
 #!/usr/bin/env python3
 # src/evaluation/report.py – v3 (always-visible equity line)
 from __future__ import annotations

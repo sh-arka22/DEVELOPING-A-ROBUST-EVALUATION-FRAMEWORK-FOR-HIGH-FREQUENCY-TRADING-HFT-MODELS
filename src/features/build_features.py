@@ -1,358 +1,1449 @@
+# #!/usr/bin/env python3
+# # Build bar‑level features & labels for one NASDAQ instrument.
+# from __future__ import annotations
+# import argparse, json, math, warnings, re
+# from pathlib import Path
+# from typing import Dict, Callable, Optional
+# import numpy as np
+# import pandas as pd
+# import numba as nb
+# from tqdm import tqdm
+# from arch import arch_model
+
+# warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ROOT     = Path(__file__).resolve().parents[1]
+# ITCH_DIR = ROOT / "data" / "processed" / "NASDAQ_ITCH"
+# ITCH_DIR.mkdir(parents=True, exist_ok=True)
+
+# # ── helpers ───────────────────────────────────────────────────────────────
+# @nb.njit(cache=True)
+# def _wma(arr: np.ndarray, n: int) -> np.ndarray:
+#     out = np.empty_like(arr)
+#     w   = np.arange(1, n+1, dtype=arr.dtype); ws = w.sum()
+#     for i in range(arr.shape[0]):
+#         out[i] = np.nan if i < n-1 else (arr[i-n+1:i+1]*w).sum()/ws
+#     return out
+
+# def ema(s: pd.Series, n:int) -> pd.Series:  return s.ewm(span=n, adjust=False).mean()
+# def dema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); return 2*e1-ema(e1,n)
+# def tema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); e2=ema(e1,n); e3=ema(e2,n); return 3*e1-3*e2+e3
+# def hma (s: pd.Series, n:int) -> pd.Series:
+#     half, root = int(n/2), int(math.sqrt(n))
+#     return pd.Series(_wma(2*_wma(s.values, half) - _wma(s.values, n), root), index=s.index)
+
+# def kama(price: pd.Series, er_period=10, fast=2, slow=30) -> pd.Series:
+#     change = price.diff(er_period).abs()
+#     vol    = price.diff().abs().rolling(er_period).sum()
+#     er     = (change / vol).fillna(0)
+#     sc     = (er*(2/(fast+1)-2/(slow+1)) + 2/(slow+1))**2
+#     out = pd.Series(index=price.index, dtype=float); out.iloc[0] = price.iloc[0]
+#     for i in range(1, len(price)):
+#         out.iloc[i] = out.iloc[i-1] + sc.iloc[i]*(price.iloc[i]-out.iloc[i-1])
+#     return out
+
+# def zscore(s: pd.Series, win=500) -> pd.Series:
+#     mu = s.rolling(win).mean() if len(s)>=win else s.expanding().mean()
+#     sd = s.rolling(win).std()  if len(s)>=win else s.expanding().std()
+#     sd = sd.replace(0, 1e-9)
+#     return (s - mu) / sd
+
+# def _ffill_resample(df: pd.DataFrame, bar_ms:int, snap_ms:int) -> pd.DataFrame:
+#     """Bring snapshots to exact bar grid with controlled ffill gap."""
+#     limit = max(1, math.ceil(snap_ms / bar_ms))
+#     def is_px(c:str) -> bool: return c.endswith("_px") or "_px_" in c or c in ("bid_px","ask_px")
+#     def is_sz(c:str) -> bool: return c.endswith("_sz") or "_sz_" in c or c.endswith("sz1")
+#     agg_map = {}
+#     for c in df.columns:
+#         if is_px(c):   agg_map[c] = "last"
+#         elif is_sz(c): agg_map[c] = "mean"
+#         else:          agg_map[c] = "last"
+#     out = df.resample(f"{bar_ms}ms").agg(agg_map).ffill(limit=limit)
+#     return out
+
+# # ── features ───────────────────────────────────────────────────────────────
+# def make_features(df: pd.DataFrame, *, bar_ms:int) -> pd.DataFrame:
+#     need = {"mid_px","microprice","spread","imbalance","last_trade_px","cum_vol",
+#             "bid_sz1","ask_sz1","ask_px","bid_px"}
+#     miss = need - set(df.columns)
+#     if miss:
+#         raise KeyError(f"Cleaner must provide columns: {miss}")
+
+#     # Drop crossed books just in case (ask<=bid)
+#     df = df[df["ask_px"] > df["bid_px"]].copy()
+
+#     f = pd.DataFrame(index=df.index)
+#     f["mid_px"]    = df["mid_px"]
+#     f["micropx"]   = df["microprice"]
+#     f["spread"]    = df["spread"]
+#     f["imbalance"] = df["imbalance"]
+#     f["ret_mid"]   = f["mid_px"].pct_change(fill_method=None).fillna(0)
+#     f["ret_micro"] = f["micropx"].pct_change(fill_method=None).fillna(0)
+#     f["log_ret"]   = np.log(f["mid_px"]).diff().fillna(0)
+
+#     # depth (L1..L5 sums & shapes)
+#     bid_depth_cols = [c for c in df.columns if re.match(r"^bid_sz(_\d+)?$", c)]
+#     ask_depth_cols = [c for c in df.columns if re.match(r"^ask_sz(_\d+)?$", c)]
+#     bid_depth = df[bid_depth_cols].fillna(0).to_numpy()
+#     ask_depth = df[ask_depth_cols].fillna(0).to_numpy()
+#     f["depth_bid_L5"] = bid_depth.sum(1)
+#     f["depth_ask_L5"] = ask_depth.sum(1)
+#     f["depth_imb5"]   = (f["depth_bid_L5"] - f["depth_ask_L5"]) / \
+#                         (f["depth_bid_L5"] + f["depth_ask_L5"] + 1e-9)
+#     f["q_iratio"] = df["bid_sz1"] / (df["bid_sz1"] + df["ask_sz1"] + 1e-9)
+#     f["depth_slope_bid"] = (df["bid_sz1"] - df.get("bid_sz_5", df["bid_sz1"])) / 4
+#     f["depth_slope_ask"] = (df["ask_sz1"] - df.get("ask_sz_5", df["ask_sz1"])) / 4
+
+#     # order‑flow
+#     trade_px = df["last_trade_px"].replace(0, np.nan).ffill()
+#     f["trade_dir"] = np.sign(trade_px - f["mid_px"]).fillna(0)
+#     vol_deltas = df["cum_vol"].diff().fillna(0)
+#     intensity_n = max(5, int(1000/bar_ms))
+#     f["of_intensity"] = vol_deltas.rolling(intensity_n).mean().fillna(0)
+#     f["trade_gap"]    = (trade_px - f["micropx"]).fillna(0)
+
+#     # volatility proxies
+#     atr_n = max(3, int(1000/bar_ms))
+#     rng   = f["mid_px"].rolling(atr_n).max() - f["mid_px"].rolling(atr_n).min()
+#     f["atr_fast"] = (rng / f["mid_px"]).fillna(method="bfill")
+
+#     n_fast = max(4, int( 800 / bar_ms))
+#     n_slow = max(8, int(2400 / bar_ms))
+#     f["dema_f"] = dema(f["micropx"], n_fast)
+#     f["dema_s"] = dema(f["micropx"], n_slow)
+#     f["tema_f"] = tema(f["micropx"], n_fast)
+#     f["hma16"]  = hma (f["micropx"], 16)
+#     f["kama"]   = kama(f["micropx"])
+
+#     n_trix = max(5, int(1500/bar_ms))
+#     ema1 = ema(f["micropx"], n_trix); ema2 = ema(ema1, n_trix); ema3 = ema(ema2, n_trix)
+#     f["trix"] = (ema3 / ema3.shift(1) - 1).fillna(0) * 100
+
+#     # GARCH on 1‑second returns (optional, ffill to bar grid)
+#     f["garch_vol"] = np.nan
+#     r1s = f["micropx"].resample("1s").last().pct_change().dropna() * 100
+#     if len(r1s) > 300:
+#         vol = arch_model(r1s, p=1, q=1).fit(disp=False).conditional_volatility
+#         f["garch_vol"] = vol.reindex(f.index, method="ffill")
+
+#     # z‑scores
+#     for col in ["spread","imbalance","depth_imb5","of_intensity"]:
+#         f[col+"_z"] = zscore(f[col])
+
+#     return f.dropna()
+
+# # ── labels (horizon in **bars**) ──────────────────────────────────────────
+# def add_label(f: pd.DataFrame, *, bar_ms:int, horizon_bars:int,
+#               alpha: float = 0.20) -> pd.DataFrame:
+#     """
+#     3‑class label at t for ΔP over next `horizon_bars`:
+#        +1 if ΔP >  max(alpha * dyn_tick, min_tick)
+#         0 if |ΔP| ≤ threshold
+#        -1 if ΔP < -max(alpha * dyn_tick, min_tick)
+#     where dyn_tick = rolling median |ΔP(1 bar)|.
+#     """
+#     steps = int(horizon_bars)
+#     ref   = f["micropx"]
+#     tgt   = ref.shift(-steps) - ref
+
+#     # robust local movement scale
+#     dyn_tick = ref.diff().abs().rolling(100).median().bfill()
+
+#     # min tick by price regime (tweak as needed)
+#     min_tick = np.where(ref < 2.0, 0.0005, 0.001)
+
+#     thr = np.maximum(alpha * dyn_tick, min_tick)
+#     f = f.copy()
+#     f["y"] = np.select([tgt > thr, tgt < -thr], [1, -1], 0).astype(np.int8)
+#     return f.dropna()
+
+# # ── NASDAQ pipeline ───────────────────────────────────────────────────────
+# def process_nasdaq(bar_ms:int, horizon:int, snap_ms:int,
+#                    stock: Optional[str], locate: Optional[int]) -> tuple[Path,Path,Path]:
+#     if locate is not None:
+#         candidate = ITCH_DIR / f"mid_{locate}_{snap_ms}ms.parquet"
+#         tag = str(locate)
+#     elif stock:
+#         candidate = ITCH_DIR / f"mid_{stock}_{snap_ms}ms.parquet"
+#         tag = stock
+#     else:
+#         raise SystemExit("Select instrument with --stock or --locate (same as cleaning).")
+
+#     if not candidate.exists():
+#         raise FileNotFoundError(f"Snapshot file not found: {candidate}\n"
+#                                 f"Run clean_nasdaq_itch.py with the same --snap_ms and instrument.")
+
+#     df = pd.read_parquet(candidate)
+#     if "timestamp" in df and not isinstance(df.index, pd.DatetimeIndex):
+#         df = df.set_index(pd.to_datetime(df["timestamp"], utc=True)).drop(columns="timestamp")
+
+#     bars = _ffill_resample(df, bar_ms, snap_ms)
+#     bars = bars[bars["ask_px"] > bars["bid_px"]]  # paranoia
+
+#     feat = make_features(bars, bar_ms=bar_ms)
+#     feat = add_label(feat, bar_ms=bar_ms, horizon_bars=horizon)  # ✅ horizon in BARS
+
+#     n = len(feat)
+#     tr, va, te = feat[:int(.7*n)], feat[int(.7*n):int(.85*n)], feat[int(.85*n):]
+#     paths = [ITCH_DIR / f"nasdaq_{tag}_{bar_ms}ms_{p}.parquet" for p in ("train","val","test")]
+#     for subset, p in zip((tr,va,te), paths):
+#         p.parent.mkdir(parents=True, exist_ok=True)
+#         subset.to_parquet(p, compression="snappy")
+#     print(f"✔ NASDAQ_ITCH {tag} @ {bar_ms} ms | horizon {horizon} bars | rows {n:,}")
+#     return tuple(paths)
+
+# _PIPE: Dict[str, Callable[...,object]] = {"NASDAQ_ITCH": process_nasdaq}
+
+# def main():
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--dataset", required=True, choices=_PIPE.keys())
+#     ap.add_argument("--bar_ms",  type=int, default=20)
+#     ap.add_argument("--horizon", type=int, default=50, help="Lookahead in bars (e.g., 50 bars @20ms ≈1s)")
+#     ap.add_argument("--snap_ms", type=int, default=20, help="Must match cleaning grid")
+#     ap.add_argument("--stock")
+#     ap.add_argument("--locate", type=int)
+#     args = ap.parse_args()
+
+#     print(f"▶ Build {args.dataset} | instrument {args.stock or args.locate} "
+#           f"@ {args.bar_ms} ms | horizon {args.horizon} bars | snap {args.snap_ms} ms")
+
+#     result = _PIPE[args.dataset](args.bar_ms, args.horizon, args.snap_ms, args.stock, args.locate)
+
+#     reg_path = ITCH_DIR / "feature_registry.json"
+#     registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+#     key = f"nasdaq_itch_{args.stock or args.locate}"
+#     registry[key] = [str(p) for p in result]
+#     reg_path.write_text(json.dumps(registry, indent=2))
+#     print("✓ Registry updated:", reg_path)
+
+# if __name__ == "__main__":
+#     main()
+
+
+
+# #!/usr/bin/env python3
+# # Build bar‑level features & labels for one NASDAQ instrument.
+# from __future__ import annotations
+# import argparse, json, math, warnings, re
+# from pathlib import Path
+# from typing import Dict, Callable, Optional
+# import numpy as np
+# import pandas as pd
+# import numba as nb
+# from tqdm import tqdm
+# from arch import arch_model
+
+# warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ROOT     = Path(__file__).resolve().parents[1]
+# ITCH_DIR = ROOT / "data" / "processed" / "NASDAQ_ITCH"
+# ITCH_DIR.mkdir(parents=True, exist_ok=True)
+
+# # ── helpers ───────────────────────────────────────────────────────────────
+# @nb.njit(cache=True)
+# def _wma(arr: np.ndarray, n: int) -> np.ndarray:
+#     out = np.empty_like(arr)
+#     w   = np.arange(1, n+1, dtype=arr.dtype); ws = w.sum()
+#     for i in range(arr.shape[0]):
+#         out[i] = np.nan if i < n-1 else (arr[i-n+1:i+1]*w).sum()/ws
+#     return out
+
+# def ema(s: pd.Series, n:int) -> pd.Series:  return s.ewm(span=n, adjust=False).mean()
+# def dema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); return 2*e1-ema(e1,n)
+# def tema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); e2=ema(e1,n); e3=ema(e2,n); return 3*e1-3*e2+e3
+# def hma (s: pd.Series, n:int) -> pd.Series:
+#     half, root = int(n/2), int(math.sqrt(n))
+#     return pd.Series(_wma(2*_wma(s.values, half) - _wma(s.values, n), root), index=s.index)
+
+# def kama(price: pd.Series, er_period=10, fast=2, slow=30) -> pd.Series:
+#     change = price.diff(er_period).abs()
+#     vol    = price.diff().abs().rolling(er_period).sum()
+#     er     = (change / vol).fillna(0)
+#     sc     = (er*(2/(fast+1)-2/(slow+1)) + 2/(slow+1))**2
+#     out = pd.Series(index=price.index, dtype=float); out.iloc[0] = price.iloc[0]
+#     for i in range(1, len(price)):
+#         out.iloc[i] = out.iloc[i-1] + sc.iloc[i]*(price.iloc[i]-out.iloc[i-1])
+#     return out
+
+# def zscore(s: pd.Series, win=500) -> pd.Series:
+#     mu = s.rolling(win).mean() if len(s)>=win else s.expanding().mean()
+#     sd = s.rolling(win).std()  if len(s)>=win else s.expanding().std()
+#     sd = sd.replace(0, 1e-9)
+#     return (s - mu) / sd
+
+# def _ffill_resample(df: pd.DataFrame, bar_ms:int, snap_ms:int) -> pd.DataFrame:
+#     """Bring snapshots to exact bar grid with controlled ffill gap."""
+#     limit = max(1, math.ceil(snap_ms / bar_ms))
+#     def is_px(c:str) -> bool: return c.endswith("_px") or "_px_" in c or c in ("bid_px","ask_px")
+#     def is_sz(c:str) -> bool: return c.endswith("_sz") or "_sz_" in c or c.endswith("sz1")
+#     agg_map = {}
+#     for c in df.columns:
+#         if is_px(c):   agg_map[c] = "last"
+#         elif is_sz(c): agg_map[c] = "mean"
+#         else:          agg_map[c] = "last"
+#     out = df.resample(f"{bar_ms}ms").agg(agg_map).ffill(limit=limit)
+#     return out
+
+# # ── features ───────────────────────────────────────────────────────────────
+# def make_features(df: pd.DataFrame, *, bar_ms:int) -> pd.DataFrame:
+#     need = {"mid_px","microprice","spread","imbalance","last_trade_px","cum_vol",
+#             "bid_sz1","ask_sz1","ask_px","bid_px"}
+#     miss = need - set(df.columns)
+#     if miss:
+#         raise KeyError(f"Cleaner must provide columns: {miss}")
+
+#     # Drop crossed books just in case (ask<=bid)
+#     df = df[df["ask_px"] > df["bid_px"]].copy()
+
+#     f = pd.DataFrame(index=df.index)
+#     f["mid_px"]    = df["mid_px"]
+#     f["micropx"]   = df["microprice"]
+#     f["spread"]    = df["spread"]
+#     f["imbalance"] = df["imbalance"]
+#     f["ret_mid"]   = f["mid_px"].pct_change(fill_method=None).fillna(0)
+#     f["ret_micro"] = f["micropx"].pct_change(fill_method=None).fillna(0)
+#     f["log_ret"]   = np.log(f["mid_px"]).diff().fillna(0)
+
+#     # depth (L1..L5 sums & shapes)
+#     bid_depth_cols = [c for c in df.columns if re.match(r"^bid_sz(_\d+)?$", c)]
+#     ask_depth_cols = [c for c in df.columns if re.match(r"^ask_sz(_\d+)?$", c)]
+#     bid_depth = df[bid_depth_cols].fillna(0).to_numpy()
+#     ask_depth = df[ask_depth_cols].fillna(0).to_numpy()
+#     f["depth_bid_L5"] = bid_depth.sum(1)
+#     f["depth_ask_L5"] = ask_depth.sum(1)
+#     f["depth_imb5"]   = (f["depth_bid_L5"] - f["depth_ask_L5"]) / \
+#                         (f["depth_bid_L5"] + f["depth_ask_L5"] + 1e-9)
+#     f["q_iratio"] = df["bid_sz1"] / (df["bid_sz1"] + df["ask_sz1"] + 1e-9)
+#     f["depth_slope_bid"] = (df["bid_sz1"] - df.get("bid_sz_5", df["bid_sz1"])) / 4
+#     f["depth_slope_ask"] = (df["ask_sz1"] - df.get("ask_sz_5", df["ask_sz1"])) / 4
+
+#     # order‑flow
+#     trade_px = df["last_trade_px"].replace(0, np.nan).ffill()
+#     f["trade_dir"] = np.sign(trade_px - f["mid_px"]).fillna(0)
+#     vol_deltas = df["cum_vol"].diff().fillna(0)
+#     intensity_n = max(5, int(1000/bar_ms))
+#     f["of_intensity"] = vol_deltas.rolling(intensity_n).mean().fillna(0)
+#     f["trade_gap"]    = (trade_px - f["micropx"]).fillna(0)
+
+#     # volatility proxies
+#     atr_n = max(3, int(1000/bar_ms))
+#     rng   = f["mid_px"].rolling(atr_n).max() - f["mid_px"].rolling(atr_n).min()
+#     f["atr_fast"] = (rng / f["mid_px"]).fillna(method="bfill")
+
+#     n_fast = max(4, int( 800 / bar_ms))
+#     n_slow = max(8, int(2400 / bar_ms))
+#     f["dema_f"] = dema(f["micropx"], n_fast)
+#     f["dema_s"] = dema(f["micropx"], n_slow)
+#     f["tema_f"] = tema(f["micropx"], n_fast)
+#     f["hma16"]  = hma (f["micropx"], 16)
+#     f["kama"]   = kama(f["micropx"])
+
+#     n_trix = max(5, int(1500/bar_ms))
+#     ema1 = ema(f["micropx"], n_trix); ema2 = ema(ema1, n_trix); ema3 = ema(ema2, n_trix)
+#     f["trix"] = (ema3 / ema3.shift(1) - 1).fillna(0) * 100
+
+#     # GARCH on 1‑second returns (optional, ffill to bar grid)
+#     f["garch_vol"] = np.nan
+#     r1s = f["micropx"].resample("1s").last().pct_change().dropna() * 100
+#     if len(r1s) > 300:
+#         vol = arch_model(r1s, p=1, q=1).fit(disp=False).conditional_volatility
+#         f["garch_vol"] = vol.reindex(f.index, method="ffill")
+
+#     # z‑scores
+#     for col in ["spread","imbalance","depth_imb5","of_intensity"]:
+#         f[col+"_z"] = zscore(f[col])
+
+#     return f.dropna()
+
+# # ── labels (horizon in **bars**) ──────────────────────────────────────────
+# def add_label(f: pd.DataFrame, *, bar_ms:int, horizon_bars:int,
+#               alpha: float = 0.20) -> pd.DataFrame:
+#     """
+#     3‑class label at t for ΔP over next `horizon_bars`:
+#        +1 if ΔP >  max(alpha * dyn_tick, min_tick)
+#         0 if |ΔP| ≤ threshold
+#        -1 if ΔP < -max(alpha * dyn_tick, min_tick)
+#     where dyn_tick = rolling median |ΔP(1 bar)|.
+#     """
+#     steps = int(horizon_bars)
+#     ref   = f["micropx"]
+#     tgt   = ref.shift(-steps) - ref
+
+#     # robust local movement scale
+#     dyn_tick = ref.diff().abs().rolling(100).median().bfill()
+
+#     # min tick by price regime (tweak as needed)
+#     min_tick = np.where(ref < 2.0, 0.0005, 0.001)
+
+#     thr = np.maximum(alpha * dyn_tick, min_tick)
+#     f = f.copy()
+#     f["y"] = np.select([tgt > thr, tgt < -thr], [1, -1], 0).astype(np.int8)
+#     return f.dropna()
+
+# # ── NASDAQ pipeline ───────────────────────────────────────────────────────
+# def process_nasdaq(bar_ms:int, horizon:int, snap_ms:int,
+#                    stock: Optional[str], locate: Optional[int]) -> tuple[Path,Path,Path]:
+#     if locate is not None:
+#         candidate = ITCH_DIR / f"mid_{locate}_{snap_ms}ms.parquet"
+#         tag = str(locate)
+#     elif stock:
+#         candidate = ITCH_DIR / f"mid_{stock}_{snap_ms}ms.parquet"
+#         tag = stock
+#     else:
+#         raise SystemExit("Select instrument with --stock or --locate (same as cleaning).")
+
+#     if not candidate.exists():
+#         raise FileNotFoundError(f"Snapshot file not found: {candidate}\n"
+#                                 f"Run clean_nasdaq_itch.py with the same --snap_ms and instrument.")
+
+#     df = pd.read_parquet(candidate)
+#     if "timestamp" in df and not isinstance(df.index, pd.DatetimeIndex):
+#         df = df.set_index(pd.to_datetime(df["timestamp"], utc=True)).drop(columns="timestamp")
+
+#     bars = _ffill_resample(df, bar_ms, snap_ms)
+#     bars = bars[bars["ask_px"] > bars["bid_px"]]  # paranoia
+
+#     feat = make_features(bars, bar_ms=bar_ms)
+#     feat = add_label(feat, bar_ms=bar_ms, horizon_bars=horizon)  # ✅ horizon in BARS
+
+#     n = len(feat)
+#     tr, va, te = feat[:int(.7*n)], feat[int(.7*n):int(.85*n)], feat[int(.85*n):]
+#     paths = [ITCH_DIR / f"nasdaq_{tag}_{bar_ms}ms_{p}.parquet" for p in ("train","val","test")]
+#     for subset, p in zip((tr,va,te), paths):
+#         p.parent.mkdir(parents=True, exist_ok=True)
+#         subset.to_parquet(p, compression="snappy")
+#     print(f"✔ NASDAQ_ITCH {tag} @ {bar_ms} ms | horizon {horizon} bars | rows {n:,}")
+#     return tuple(paths)
+
+# _PIPE: Dict[str, Callable[...,object]] = {"NASDAQ_ITCH": process_nasdaq}
+
+# def main():
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--dataset", required=True, choices=_PIPE.keys())
+#     ap.add_argument("--bar_ms",  type=int, default=20)
+#     ap.add_argument("--horizon", type=int, default=50, help="Lookahead in bars (e.g., 50 bars @20ms ≈1s)")
+#     ap.add_argument("--snap_ms", type=int, default=20, help="Must match cleaning grid")
+#     ap.add_argument("--stock")
+#     ap.add_argument("--locate", type=int)
+#     args = ap.parse_args()
+
+#     print(f"▶ Build {args.dataset} | instrument {args.stock or args.locate} "
+#           f"@ {args.bar_ms} ms | horizon {args.horizon} bars | snap {args.snap_ms} ms")
+
+#     result = _PIPE[args.dataset](args.bar_ms, args.horizon, args.snap_ms, args.stock, args.locate)
+
+#     reg_path = ITCH_DIR / "feature_registry.json"
+#     registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+#     key = f"nasdaq_itch_{args.stock or args.locate}"
+#     registry[key] = [str(p) for p in result]
+#     reg_path.write_text(json.dumps(registry, indent=2))
+#     print("✓ Registry updated:", reg_path)
+
+# if __name__ == "__main__":
+#     main()
+
+
+# #!/usr/bin/env python3
+# # Build bar‑level features & labels for one NASDAQ instrument.
+# from __future__ import annotations
+# import argparse, json, math, warnings, re
+# from pathlib import Path
+# from typing import Dict, Callable, Optional
+# import numpy as np
+# import pandas as pd
+# import numba as nb
+# from tqdm import tqdm
+# from arch import arch_model
+
+# warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ROOT     = Path(__file__).resolve().parents[1]
+# ITCH_DIR = ROOT / "data" / "processed" / "NASDAQ_ITCH"
+# ITCH_DIR.mkdir(parents=True, exist_ok=True)
+
+# # ── helpers ───────────────────────────────────────────────────────────────
+# @nb.njit(cache=True)
+# def _wma(arr: np.ndarray, n: int) -> np.ndarray:
+#     out = np.empty_like(arr)
+#     w   = np.arange(1, n+1, dtype=arr.dtype); ws = w.sum()
+#     for i in range(arr.shape[0]):
+#         out[i] = np.nan if i < n-1 else (arr[i-n+1:i+1]*w).sum()/ws
+#     return out
+
+# def ema(s: pd.Series, n:int) -> pd.Series:  return s.ewm(span=n, adjust=False).mean()
+# def dema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); return 2*e1-ema(e1,n)
+# def tema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); e2=ema(e1,n); e3=ema(e2,n); return 3*e1-3*e2+e3
+# def hma (s: pd.Series, n:int) -> pd.Series:
+#     half, root = int(n/2), int(math.sqrt(n))
+#     return pd.Series(_wma(2*_wma(s.values, half) - _wma(s.values, n), root), index=s.index)
+
+# def kama(price: pd.Series, er_period=10, fast=2, slow=30) -> pd.Series:
+#     change = price.diff(er_period).abs()
+#     vol    = price.diff().abs().rolling(er_period).sum()
+#     er     = (change / vol).fillna(0)
+#     sc     = (er*(2/(fast+1)-2/(slow+1)) + 2/(slow+1))**2
+#     out = pd.Series(index=price.index, dtype=float); out.iloc[0] = price.iloc[0]
+#     for i in range(1, len(price)):
+#         out.iloc[i] = out.iloc[i-1] + sc.iloc[i]*(price.iloc[i]-out.iloc[i-1])
+#     return out
+
+# def zscore(s: pd.Series, win=500) -> pd.Series:
+#     mu = s.rolling(win).mean() if len(s)>=win else s.expanding().mean()
+#     sd = s.rolling(win).std()  if len(s)>=win else s.expanding().std()
+#     sd = sd.replace(0, 1e-9)
+#     return (s - mu) / sd
+
+# def _ffill_resample(df: pd.DataFrame, bar_ms:int, snap_ms:int) -> pd.DataFrame:
+#     """Bring snapshots to exact bar grid with controlled ffill gap."""
+#     limit = max(1, math.ceil(snap_ms / bar_ms))
+#     def is_px(c:str) -> bool: return c.endswith("_px") or "_px_" in c or c in ("bid_px","ask_px")
+#     def is_sz(c:str) -> bool: return c.endswith("_sz") or "_sz_" in c or c.endswith("sz1")
+#     agg_map = {}
+#     for c in df.columns:
+#         if is_px(c):   agg_map[c] = "last"
+#         elif is_sz(c): agg_map[c] = "mean"
+#         else:          agg_map[c] = "last"
+#     out = df.resample(f"{bar_ms}ms").agg(agg_map).ffill(limit=limit)
+#     return out
+
+# # ── features ───────────────────────────────────────────────────────────────
+# def make_features(df: pd.DataFrame, *, bar_ms:int) -> pd.DataFrame:
+#     need = {"mid_px","microprice","spread","imbalance","last_trade_px","cum_vol",
+#             "bid_sz1","ask_sz1","ask_px","bid_px"}
+#     miss = need - set(df.columns)
+#     if miss:
+#         raise KeyError(f"Cleaner must provide columns: {miss}")
+
+#     # Drop crossed books just in case (ask<=bid)
+#     df = df[df["ask_px"] > df["bid_px"]].copy()
+
+#     f = pd.DataFrame(index=df.index)
+#     f["mid_px"]    = df["mid_px"]
+#     f["micropx"]   = df["microprice"]
+#     f["spread"]    = df["spread"]
+#     f["imbalance"] = df["imbalance"]
+#     f["ret_mid"]   = f["mid_px"].pct_change(fill_method=None).fillna(0)
+#     f["ret_micro"] = f["micropx"].pct_change(fill_method=None).fillna(0)
+#     f["log_ret"]   = np.log(f["mid_px"]).diff().fillna(0)
+
+#     # depth (L1..L5 sums & shapes)
+#     bid_depth_cols = [c for c in df.columns if re.match(r"^bid_sz(_\d+)?$", c)]
+#     ask_depth_cols = [c for c in df.columns if re.match(r"^ask_sz(_\d+)?$", c)]
+#     bid_depth = df[bid_depth_cols].fillna(0).to_numpy()
+#     ask_depth = df[ask_depth_cols].fillna(0).to_numpy()
+#     f["depth_bid_L5"] = bid_depth.sum(1)
+#     f["depth_ask_L5"] = ask_depth.sum(1)
+#     f["depth_imb5"]   = (f["depth_bid_L5"] - f["depth_ask_L5"]) / \
+#                         (f["depth_bid_L5"] + f["depth_ask_L5"] + 1e-9)
+#     f["q_iratio"] = df["bid_sz1"] / (df["bid_sz1"] + df["ask_sz1"] + 1e-9)
+#     f["depth_slope_bid"] = (df["bid_sz1"] - df.get("bid_sz_5", df["bid_sz1"])) / 4
+#     f["depth_slope_ask"] = (df["ask_sz1"] - df.get("ask_sz_5", df["ask_sz1"])) / 4
+
+#     # order‑flow
+#     trade_px = df["last_trade_px"].replace(0, np.nan).ffill()
+#     f["trade_dir"] = np.sign(trade_px - f["mid_px"]).fillna(0)
+#     vol_deltas = df["cum_vol"].diff().fillna(0)
+#     intensity_n = max(5, int(1000/bar_ms))
+#     f["of_intensity"] = vol_deltas.rolling(intensity_n).mean().fillna(0)
+#     f["trade_gap"]    = (trade_px - f["micropx"]).fillna(0)
+
+#     # volatility proxies
+#     atr_n = max(3, int(1000/bar_ms))
+#     rng   = f["mid_px"].rolling(atr_n).max() - f["mid_px"].rolling(atr_n).min()
+#     f["atr_fast"] = (rng / f["mid_px"]).fillna(method="bfill")
+
+#     n_fast = max(4, int( 800 / bar_ms))
+#     n_slow = max(8, int(2400 / bar_ms))
+#     f["dema_f"] = dema(f["micropx"], n_fast)
+#     f["dema_s"] = dema(f["micropx"], n_slow)
+#     f["tema_f"] = tema(f["micropx"], n_fast)
+#     f["hma16"]  = hma (f["micropx"], 16)
+#     f["kama"]   = kama(f["micropx"])
+
+#     n_trix = max(5, int(1500/bar_ms))
+#     ema1 = ema(f["micropx"], n_trix); ema2 = ema(ema1, n_trix); ema3 = ema(ema2, n_trix)
+#     f["trix"] = (ema3 / ema3.shift(1) - 1).fillna(0) * 100
+
+#     # GARCH on 1‑second returns (optional, ffill to bar grid)
+#     f["garch_vol"] = np.nan
+#     r1s = f["micropx"].resample("1s").last().pct_change().dropna() * 100
+#     if len(r1s) > 300:
+#         vol = arch_model(r1s, p=1, q=1).fit(disp=False).conditional_volatility
+#         f["garch_vol"] = vol.reindex(f.index, method="ffill")
+
+#     # z‑scores
+#     for col in ["spread","imbalance","depth_imb5","of_intensity"]:
+#         f[col+"_z"] = zscore(f[col])
+
+#     return f.dropna()
+
+# # ── labels (horizon in **bars**) ──────────────────────────────────────────
+# def add_label(f: pd.DataFrame, *, bar_ms:int, horizon_bars:int,
+#               alpha: float = 0.20) -> pd.DataFrame:
+#     """
+#     3‑class label at t for ΔP over next `horizon_bars`:
+#        +1 if ΔP >  max(alpha * dyn_tick, min_tick)
+#         0 if |ΔP| ≤ threshold
+#        -1 if ΔP < -max(alpha * dyn_tick, min_tick)
+
+#     If you see only a single class after building, LOWER alpha (e.g. 0.10 or 0.05)
+#     and rebuild features for this instrument/day/horizon.
+#     """
+#     steps = int(horizon_bars)
+#     ref   = f["micropx"]
+#     tgt   = ref.shift(-steps) - ref
+
+#     # robust local movement scale
+#     dyn_tick = ref.diff().abs().rolling(100).median().bfill()
+
+#     # min tick by price regime (tweak as needed)
+#     min_tick = np.where(ref < 2.0, 0.0005, 0.001)
+
+#     thr = np.maximum(alpha * dyn_tick, min_tick)
+#     f = f.copy()
+#     f["y"] = np.select([tgt > thr, tgt < -thr], [1, -1], 0).astype(np.int8)
+#     return f.dropna()
+
+# # ── NASDAQ pipeline ───────────────────────────────────────────────────────
+# def process_nasdaq(bar_ms:int, horizon:int, snap_ms:int,
+#                    stock: Optional[str], locate: Optional[int],
+#                    alpha: float) -> tuple[Path,Path,Path]:
+#     if locate is not None:
+#         candidate = ITCH_DIR / f"mid_{locate}_{snap_ms}ms.parquet"
+#         tag = str(locate)
+#     elif stock:
+#         candidate = ITCH_DIR / f"mid_{stock}_{snap_ms}ms.parquet"
+#         tag = stock
+#     else:
+#         raise SystemExit("Select instrument with --stock or --locate (same as cleaning).")
+
+#     if not candidate.exists():
+#         raise FileNotFoundError(f"Snapshot file not found: {candidate}\n"
+#                                 f"Run clean_nasdaq_itch.py with the same --snap_ms and instrument.")
+
+#     df = pd.read_parquet(candidate)
+#     if "timestamp" in df and not isinstance(df.index, pd.DatetimeIndex):
+#         df = df.set_index(pd.to_datetime(df["timestamp"], utc=True)).drop(columns="timestamp")
+
+#     bars = _ffill_resample(df, bar_ms, snap_ms)
+#     bars = bars[bars["ask_px"] > bars["bid_px"]]  # paranoia
+
+#     feat = make_features(bars, bar_ms=bar_ms)
+#     feat = add_label(feat, bar_ms=bar_ms, horizon_bars=horizon, alpha=alpha)  # ✅ alpha exposed
+
+#     # quick sanity: label distribution
+#     vc = feat["y"].value_counts(dropna=False).sort_index()
+#     print("Label distribution (y):", vc.to_dict())
+#     if vc.shape[0] <= 1:
+#         print("⚠️  Only a single class present. Rebuild with a smaller --alpha "
+#               "(e.g., 0.10 or 0.05) for this instrument/day/horizon.")
+
+#     n = len(feat)
+#     tr, va, te = feat[:int(.7*n)], feat[int(.7*n):int(.85*n)], feat[int(.85*n):]
+#     paths = [ITCH_DIR / f"nasdaq_{tag}_{bar_ms}ms_{p}.parquet" for p in ("train","val","test")]
+#     for subset, p in zip((tr,va,te), paths):
+#         p.parent.mkdir(parents=True, exist_ok=True)
+#         subset.to_parquet(p, compression="snappy")
+#     print(f"✔ NASDAQ_ITCH {tag} @ {bar_ms} ms | horizon {horizon} bars | alpha {alpha} | rows {n:,}")
+#     return tuple(paths)
+
+# _PIPE: Dict[str, Callable[...,object]] = {"NASDAQ_ITCH": process_nasdaq}
+
+# def main():
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--dataset", required=True, choices=_PIPE.keys())
+#     ap.add_argument("--bar_ms",  type=int, default=20)
+#     ap.add_argument("--horizon", type=int, default=50, help="Lookahead in bars (e.g., 50 bars @20ms ≈1s)")
+#     ap.add_argument("--snap_ms", type=int, default=20, help="Must match cleaning grid")
+#     ap.add_argument("--alpha",   type=float, default=0.20, help="Label threshold scale (lower → more ±1s)")
+#     ap.add_argument("--stock")
+#     ap.add_argument("--locate", type=int)
+#     args = ap.parse_args()
+
+#     print(f"▶ Build {args.dataset} | instrument {args.stock or args.locate} "
+#           f"@ {args.bar_ms} ms | horizon {args.horizon} bars | snap {args.snap_ms} ms | alpha {args.alpha}")
+
+#     result = _PIPE[args.dataset](args.bar_ms, args.horizon, args.snap_ms, args.stock, args.locate, args.alpha)
+
+#     reg_path = ITCH_DIR / "feature_registry.json"
+#     registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+#     key = f"nasdaq_itch_{args.stock or args.locate}"
+#     registry[key] = [str(p) for p in result]
+#     reg_path.write_text(json.dumps(registry, indent=2))
+#     print("✓ Registry updated:", reg_path)
+
+# if __name__ == "__main__":
+#     main()
+
+
+# #!/usr/bin/env python3
+# # Build bar‑level features & labels for one NASDAQ instrument.
+# from __future__ import annotations
+# import argparse, json, math, warnings, re
+# from pathlib import Path
+# from typing import Dict, Callable, Optional
+# import numpy as np
+# import pandas as pd
+# import numba as nb
+# from arch import arch_model
+
+# warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ROOT     = Path(__file__).resolve().parents[1]
+# ITCH_DIR = ROOT / "data" / "processed" / "NASDAQ_ITCH"
+# ITCH_DIR.mkdir(parents=True, exist_ok=True)
+
+# # ── helpers ───────────────────────────────────────────────────────────────
+# @nb.njit(cache=True)
+# def _wma(arr: np.ndarray, n: int) -> np.ndarray:
+#     out = np.empty_like(arr)
+#     w   = np.arange(1, n+1, dtype=arr.dtype); ws = w.sum()
+#     for i in range(arr.shape[0]):
+#         out[i] = np.nan if i < n-1 else (arr[i-n+1:i+1]*w).sum()/ws
+#     return out
+
+# def ema(s: pd.Series, n:int) -> pd.Series:  return s.ewm(span=n, adjust=False).mean()
+# def dema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); return 2*e1-ema(e1,n)
+# def tema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); e2=ema(e1,n); e3=ema(e2,n); return 3*e1-3*e2+e3
+# def hma (s: pd.Series, n:int) -> pd.Series:
+#     half, root = int(n/2), int(math.sqrt(n))
+#     return pd.Series(_wma(2*_wma(s.values, half) - _wma(s.values, n), root), index=s.index)
+
+# def kama(price: pd.Series, er_period=10, fast=2, slow=30) -> pd.Series:
+#     change = price.diff(er_period).abs()
+#     vol    = price.diff().abs().rolling(er_period).sum()
+#     er     = (change / vol).fillna(0)
+#     sc     = (er*(2/(fast+1)-2/(slow+1)) + 2/(slow+1))**2
+#     out = pd.Series(index=price.index, dtype=float); out.iloc[0] = price.iloc[0]
+#     for i in range(1, len(price)):
+#         out.iloc[i] = out.iloc[i-1] + sc.iloc[i]*(price.iloc[i]-out.iloc[i-1])
+#     return out
+
+# def zscore(s: pd.Series, win=500) -> pd.Series:
+#     mu = s.rolling(win).mean() if len(s)>=win else s.expanding().mean()
+#     sd = s.rolling(win).std()  if len(s)>=win else s.expanding().std()
+#     sd = sd.replace(0, 1e-9)
+#     return (s - mu) / sd
+
+# def _ffill_resample(df: pd.DataFrame, bar_ms:int, snap_ms:int) -> pd.DataFrame:
+#     """Bring snapshots to exact bar grid with controlled ffill gap."""
+#     import math as _m
+#     limit = max(1, _m.ceil(snap_ms / bar_ms))
+#     def is_px(c:str) -> bool: return c.endswith("_px") or "_px_" in c or c in ("bid_px","ask_px")
+#     def is_sz(c:str) -> bool: return c.endswith("_sz") or "_sz_" in c or c.endswith("sz1")
+#     agg_map = {}
+#     for c in df.columns:
+#         if is_px(c):   agg_map[c] = "last"
+#         elif is_sz(c): agg_map[c] = "mean"
+#         else:          agg_map[c] = "last"
+#     out = df.resample(f"{bar_ms}ms").agg(agg_map).ffill(limit=limit)
+#     return out
+
+# # ── features ───────────────────────────────────────────────────────────────
+# def make_features(df: pd.DataFrame, *, bar_ms:int) -> pd.DataFrame:
+#     need = {"mid_px","microprice","spread","imbalance","last_trade_px","cum_vol",
+#             "bid_sz1","ask_sz1","ask_px","bid_px"}
+#     miss = need - set(df.columns)
+#     if miss:
+#         raise KeyError(f"Cleaner must provide columns: {miss}")
+
+#     # Drop crossed books just in case (ask<=bid)
+#     df = df[df["ask_px"] > df["bid_px"]].copy()
+
+#     f = pd.DataFrame(index=df.index)
+#     f["mid_px"]    = df["mid_px"]
+#     f["micropx"]   = df["microprice"]
+#     f["spread"]    = df["spread"]
+#     f["imbalance"] = df["imbalance"]
+#     f["ret_mid"]   = f["mid_px"].pct_change(fill_method=None).fillna(0)
+#     f["ret_micro"] = f["micropx"].pct_change(fill_method=None).fillna(0)
+#     f["log_ret"]   = np.log(f["mid_px"]).diff().fillna(0)
+
+#     # depth (L1..L5 sums & shapes)
+#     bid_depth_cols = [c for c in df.columns if re.match(r"^bid_sz(_\d+)?$", c)]
+#     ask_depth_cols = [c for c in df.columns if re.match(r"^ask_sz(_\d+)?$", c)]
+#     bid_depth = df[bid_depth_cols].fillna(0).to_numpy()
+#     ask_depth = df[ask_depth_cols].fillna(0).to_numpy()
+#     f["depth_bid_L5"] = bid_depth.sum(1)
+#     f["depth_ask_L5"] = ask_depth.sum(1)
+#     f["depth_imb5"]   = (f["depth_bid_L5"] - f["depth_ask_L5"]) / \
+#                         (f["depth_bid_L5"] + f["depth_ask_L5"] + 1e-9)
+#     f["q_iratio"] = df["bid_sz1"] / (df["bid_sz1"] + df["ask_sz1"] + 1e-9)
+#     f["depth_slope_bid"] = (df["bid_sz1"] - df.get("bid_sz_5", df["bid_sz1"])) / 4
+#     f["depth_slope_ask"] = (df["ask_sz1"] - df.get("ask_sz_5", df["ask_sz1"])) / 4
+
+#     # order‑flow
+#     trade_px = df["last_trade_px"].replace(0, np.nan).ffill()
+#     f["trade_dir"] = np.sign(trade_px - f["mid_px"]).fillna(0)
+#     vol_deltas = df["cum_vol"].diff().fillna(0)
+#     intensity_n = max(5, int(1000/bar_ms))
+#     f["of_intensity"] = vol_deltas.rolling(intensity_n).mean().fillna(0)
+#     f["trade_gap"]    = (trade_px - f["micropx"]).fillna(0)
+
+#     # volatility proxies
+#     atr_n = max(3, int(1000/bar_ms))
+#     rng   = f["mid_px"].rolling(atr_n).max() - f["mid_px"].rolling(atr_n).min()
+#     f["atr_fast"] = (rng / f["mid_px"]).fillna(method="bfill")
+
+#     n_fast = max(4, int( 800 / bar_ms))
+#     n_slow = max(8, int(2400 / bar_ms))
+#     f["dema_f"] = dema(f["micropx"], n_fast)
+#     f["dema_s"] = dema(f["micropx"], n_slow)
+#     f["tema_f"] = tema(f["micropx"], n_fast)
+#     f["hma16"]  = hma (f["micropx"], 16)
+#     f["kama"]   = kama(f["micropx"])
+
+#     n_trix = max(5, int(1500/bar_ms))
+#     ema1 = ema(f["micropx"], n_trix); ema2 = ema(ema1, n_trix); ema3 = ema(ema2, n_trix)
+#     f["trix"] = (ema3 / ema3.shift(1) - 1).fillna(0) * 100
+
+#     # GARCH on 1‑second returns (optional, ffill to bar grid)
+#     f["garch_vol"] = np.nan
+#     r1s = f["micropx"].resample("1s").last().pct_change().dropna() * 100
+#     if len(r1s) > 300:
+#         vol = arch_model(r1s, p=1, q=1).fit(disp=False).conditional_volatility
+#         f["garch_vol"] = vol.reindex(f.index, method="ffill")
+
+#     # z‑scores
+#     for col in ["spread","imbalance","depth_imb5","of_intensity"]:
+#         f[col+"_z"] = zscore(f[col])
+
+#     return f.dropna()
+
+# # ── labels (horizon in **bars**) ──────────────────────────────────────────
+# def add_label(f: pd.DataFrame, *, bar_ms:int, horizon_bars:int,
+#               alpha: float = 0.20) -> pd.DataFrame:
+#     """
+#     3‑class label at t for ΔP over next `horizon_bars`:
+#        +1 if ΔP >  max(alpha * dyn_tick, min_tick)
+#         0 if |ΔP| ≤ threshold
+#        -1 if ΔP < -max(alpha * dyn_tick, min_tick)
+
+#     If you see only a single class after building, LOWER alpha (e.g. 0.10, 0.05, 0.005)
+#     and/or filter to RTH. Then rebuild.
+#     """
+#     steps = int(horizon_bars)
+#     ref   = f["micropx"]
+#     tgt   = ref.shift(-steps) - ref
+
+#     # robust local movement scale
+#     dyn_tick = ref.diff().abs().rolling(100).median().bfill()
+
+#     # min tick by price regime
+#     min_tick = np.where(ref < 2.0, 0.0005, 0.01)  # 1 cent for typical US stocks
+
+#     thr = np.maximum(alpha * dyn_tick, min_tick)
+#     f = f.copy()
+#     f["y"] = np.select([tgt > thr, tgt < -thr], [1, -1], 0).astype(np.int8)
+#     return f.dropna()
+
+# # ── NASDAQ pipeline ───────────────────────────────────────────────────────
+# def process_nasdaq(bar_ms:int, horizon:int, snap_ms:int,
+#                    stock: Optional[str], locate: Optional[int],
+#                    alpha: float, rth_only: bool) -> tuple[Path,Path,Path]:
+#     # resolve snapshot file
+#     if locate is not None:
+#         candidate = ITCH_DIR / f"mid_{locate}_{snap_ms}ms.parquet"
+#         tag = str(locate)
+#     elif stock:
+#         candidate = ITCH_DIR / f"mid_{stock}_{snap_ms}ms.parquet"
+#         tag = stock
+#     else:
+#         raise SystemExit("Select instrument with --stock or --locate (same as cleaning).")
+
+#     if not candidate.exists():
+#         raise FileNotFoundError(
+#             f"Snapshot file not found: {candidate}\n"
+#             f"Run clean_nasdaq_itch.py with the same --snap_ms and instrument."
+#         )
+
+#     df = pd.read_parquet(candidate)
+#     if "timestamp" in df and not isinstance(df.index, pd.DatetimeIndex):
+#         df = df.set_index(pd.to_datetime(df["timestamp"], utc=True)).drop(columns="timestamp")
+
+#     # Optional: filter to regular trading hours in America/New_York
+#     if rth_only:
+#         df_ny = df.tz_convert("America/New_York")
+#         df_ny = df_ny.between_time("09:30", "16:00", include_end=False)
+#         df = df_ny.tz_convert("UTC")
+
+#     # resample to bar grid
+#     bars = _ffill_resample(df, bar_ms, snap_ms)
+#     bars = bars[bars["ask_px"] > bars["bid_px"]]  # paranoia
+
+#     # features + labels
+#     feat = make_features(bars, bar_ms=bar_ms)
+#     feat = add_label(feat, bar_ms=bar_ms, horizon_bars=horizon, alpha=alpha)
+
+#     # split and write
+#     n = len(feat)
+#     tr, va, te = feat[:int(.7*n)], feat[int(.7*n):int(.85*n)], feat[int(.85*n):]
+#     paths = [ITCH_DIR / f"nasdaq_{tag}_{bar_ms}ms_{p}.parquet" for p in ("train","val","test")]
+#     for subset, p in zip((tr,va,te), paths):
+#         p.parent.mkdir(parents=True, exist_ok=True)
+#         subset.to_parquet(p, compression="snappy")
+
+#     # Diagnostics
+#     print(f"✔ NASDAQ_ITCH {tag} @ {bar_ms} ms | horizon {horizon} bars | alpha {alpha} | rows {n:,}")
+#     for name, part in zip(("train","val","test"), (tr,va,te)):
+#         vc = part["y"].value_counts().to_dict()
+#         print(f"  {name:>5} label counts → {vc}")
+
+#     return tuple(paths)
+
+# def main():
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--dataset", required=True, choices=["NASDAQ_ITCH"])
+#     ap.add_argument("--bar_ms",  type=int, default=20)
+#     ap.add_argument("--horizon", type=int, default=50, help="Lookahead in bars (e.g., 50 bars @20ms ≈1s)")
+#     ap.add_argument("--snap_ms", type=int, default=20, help="Must match cleaning grid")
+#     ap.add_argument("--stock")
+#     ap.add_argument("--locate", type=int)
+#     ap.add_argument("--alpha", type=float, default=0.20,
+#                     help="Label threshold multiplier for dyn_tick (try 0.20, 0.10, 0.05, 0.005)")
+#     ap.add_argument("--rth", action="store_true",
+#                     help="Use only 09:30–16:00 America/New_York to avoid dead time")
+#     args = ap.parse_args()
+
+#     print(f"▶ Build {args.dataset} | instrument {args.stock or args.locate} "
+#           f"@ {args.bar_ms} ms | horizon {args.horizon} bars | snap {args.snap_ms} ms | "
+#           f"alpha={args.alpha} | rth={args.rth}")
+
+#     train, val, test = process_nasdaq(
+#         args.bar_ms, args.horizon, args.snap_ms, args.stock, args.locate, args.alpha, args.rth
+#     )
+
+#     reg_path = ITCH_DIR / "feature_registry.json"
+#     registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+#     key = f"nasdaq_itch_{args.stock or args.locate}"
+#     registry[key] = [str(train), str(val), str(test)]
+#     reg_path.write_text(json.dumps(registry, indent=2))
+#     print("✓ Registry updated:", reg_path)
+
+# if __name__ == "__main__":
+#     main()
+
+# #!/usr/bin/env python3
+# # Build bar‑level features & labels for one NASDAQ instrument.
+# from __future__ import annotations
+# import argparse, json, math, warnings, re
+# from pathlib import Path
+# from typing import Dict, Callable, Optional
+# import numpy as np
+# import pandas as pd
+# import numba as nb
+# from arch import arch_model
+
+# warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ROOT     = Path(__file__).resolve().parents[1]
+# ITCH_DIR = ROOT / "data" / "processed" / "NASDAQ_ITCH"
+# ITCH_DIR.mkdir(parents=True, exist_ok=True)
+
+# # ── helpers ───────────────────────────────────────────────────────────────
+# @nb.njit(cache=True)
+# def _wma(arr: np.ndarray, n: int) -> np.ndarray:
+#     out = np.empty_like(arr)
+#     w   = np.arange(1, n+1, dtype=arr.dtype); ws = w.sum()
+#     for i in range(arr.shape[0]):
+#         out[i] = np.nan if i < n-1 else (arr[i-n+1:i+1]*w).sum()/ws
+#     return out
+
+# def ema(s: pd.Series, n:int) -> pd.Series:  return s.ewm(span=n, adjust=False).mean()
+# def dema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); return 2*e1-ema(e1,n)
+# def tema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); e2=ema(e1,n); e3=ema(e2,n); return 3*e1-3*e2+e3
+# def hma (s: pd.Series, n:int) -> pd.Series:
+#     half, root = int(n/2), int(math.sqrt(n))
+#     return pd.Series(_wma(2*_wma(s.values, half) - _wma(s.values, n), root), index=s.index)
+
+# def kama(price: pd.Series, er_period=10, fast=2, slow=30) -> pd.Series:
+#     change = price.diff(er_period).abs()
+#     vol    = price.diff().abs().rolling(er_period).sum()
+#     er     = (change / vol).fillna(0)
+#     sc     = (er*(2/(fast+1)-2/(slow+1)) + 2/(slow+1))**2
+#     out = pd.Series(index=price.index, dtype=float); out.iloc[0] = price.iloc[0]
+#     for i in range(1, len(price)):
+#         out.iloc[i] = out.iloc[i-1] + sc.iloc[i]*(price.iloc[i]-out.iloc[i-1])
+#     return out
+
+# def zscore(s: pd.Series, win=500) -> pd.Series:
+#     mu = s.rolling(win).mean() if len(s)>=win else s.expanding().mean()
+#     sd = s.rolling(win).std()  if len(s)>=win else s.expanding().std()
+#     sd = sd.replace(0, 1e-9)
+#     return (s - mu) / sd
+
+# def _ffill_resample(df: pd.DataFrame, bar_ms:int, snap_ms:int) -> pd.DataFrame:
+#     """Bring snapshots to exact bar grid with controlled ffill gap."""
+#     limit = max(1, math.ceil(snap_ms / bar_ms))
+#     def is_px(c:str) -> bool: return c.endswith("_px") or "_px_" in c or c in ("bid_px","ask_px")
+#     def is_sz(c:str) -> bool: return c.endswith("_sz") or "_sz_" in c or c.endswith("sz1")
+#     agg_map = {}
+#     for c in df.columns:
+#         if is_px(c):   agg_map[c] = "last"
+#         elif is_sz(c): agg_map[c] = "mean"
+#         else:          agg_map[c] = "last"
+#     out = df.resample(f"{bar_ms}ms").agg(agg_map).ffill(limit=limit)
+#     return out
+
+# # ── new: time‑of‑day filter ───────────────────────────────────────────────
+# def _filter_time_of_day(bars: pd.DataFrame,
+#                         start: str = "09:00:00",
+#                         end:   str = "17:00:00",
+#                         tz:    str = "America/New_York") -> pd.DataFrame:
+#     """
+#     Keep only rows whose *local* clock (tz) falls inside [start, end).
+#     bars index is UTC; we convert to tz and slice by local time of day.
+#     """
+#     if not isinstance(bars.index, pd.DatetimeIndex) or bars.index.tz is None:
+#         raise ValueError("bars index must be tz‑aware DateTimeIndex (UTC).")
+#     local_idx = bars.index.tz_convert(tz)
+#     t = local_idx.time
+#     start_t = pd.to_datetime(start).time()
+#     end_t   = pd.to_datetime(end).time()
+
+#     if start_t <= end_t:
+#         mask = (t >= start_t) & (t < end_t)
+#     else:
+#         # window crossing midnight (not your case, but safe)
+#         mask = (t >= start_t) | (t < end_t)
+#     out = bars[mask]
+#     return out
+
+# # ── features ───────────────────────────────────────────────────────────────
+# def make_features(df: pd.DataFrame, *, bar_ms:int) -> pd.DataFrame:
+#     need = {"mid_px","microprice","spread","imbalance","last_trade_px","cum_vol",
+#             "bid_sz1","ask_sz1","ask_px","bid_px"}
+#     miss = need - set(df.columns)
+#     if miss:
+#         raise KeyError(f"Cleaner must provide columns: {miss}")
+
+#     # Drop crossed books just in case (ask<=bid)
+#     df = df[df["ask_px"] > df["bid_px"]].copy()
+
+#     f = pd.DataFrame(index=df.index)
+#     f["mid_px"]    = df["mid_px"]
+#     f["micropx"]   = df["microprice"]
+#     f["spread"]    = df["spread"]
+#     f["imbalance"] = df["imbalance"]
+#     f["ret_mid"]   = f["mid_px"].pct_change(fill_method=None).fillna(0)
+#     f["ret_micro"] = f["micropx"].pct_change(fill_method=None).fillna(0)
+#     f["log_ret"]   = np.log(f["mid_px"]).diff().fillna(0)
+
+#     # depth (L1..L5 sums & shapes)
+#     bid_depth_cols = [c for c in df.columns if re.match(r"^bid_sz(_\d+)?$", c)]
+#     ask_depth_cols = [c for c in df.columns if re.match(r"^ask_sz(_\d+)?$", c)]
+#     bid_depth = df[bid_depth_cols].fillna(0).to_numpy()
+#     ask_depth = df[ask_depth_cols].fillna(0).to_numpy()
+#     f["depth_bid_L5"] = bid_depth.sum(1)
+#     f["depth_ask_L5"] = ask_depth.sum(1)
+#     f["depth_imb5"]   = (f["depth_bid_L5"] - f["depth_ask_L5"]) / \
+#                         (f["depth_bid_L5"] + f["depth_ask_L5"] + 1e-9)
+#     f["q_iratio"] = df["bid_sz1"] / (df["bid_sz1"] + df["ask_sz1"] + 1e-9)
+#     f["depth_slope_bid"] = (df["bid_sz1"] - df.get("bid_sz_5", df["bid_sz1"])) / 4
+#     f["depth_slope_ask"] = (df["ask_sz1"] - df.get("ask_sz_5", df["ask_sz1"])) / 4
+
+#     # order‑flow
+#     trade_px = df["last_trade_px"].replace(0, np.nan).ffill()
+#     f["trade_dir"] = np.sign(trade_px - f["mid_px"]).fillna(0)
+#     vol_deltas = df["cum_vol"].diff().fillna(0)
+#     intensity_n = max(5, int(1000/bar_ms))
+#     f["of_intensity"] = vol_deltas.rolling(intensity_n).mean().fillna(0)
+#     f["trade_gap"]    = (trade_px - f["micropx"]).fillna(0)
+
+#     # volatility proxies
+#     atr_n = max(3, int(1000/bar_ms))
+#     rng   = f["mid_px"].rolling(atr_n).max() - f["mid_px"].rolling(atr_n).min()
+#     f["atr_fast"] = (rng / f["mid_px"]).fillna(method="bfill")
+
+#     n_fast = max(4, int( 800 / bar_ms))
+#     n_slow = max(8, int(2400 / bar_ms))
+#     f["dema_f"] = dema(f["micropx"], n_fast)
+#     f["dema_s"] = dema(f["micropx"], n_slow)
+#     f["tema_f"] = tema(f["micropx"], n_fast)
+#     f["hma16"]  = hma (f["micropx"], 16)
+#     f["kama"]   = kama(f["micropx"])
+
+#     n_trix = max(5, int(1500/bar_ms))
+#     ema1 = ema(f["micropx"], n_trix); ema2 = ema(ema1, n_trix); ema3 = ema(ema2, n_trix)
+#     f["trix"] = (ema3 / ema3.shift(1) - 1).fillna(0) * 100
+
+#     # GARCH on 1‑second returns (optional, ffill to bar grid)
+#     f["garch_vol"] = np.nan
+#     r1s = f["micropx"].resample("1s").last().pct_change().dropna() * 100
+#     if len(r1s) > 300:
+#         vol = arch_model(r1s, p=1, q=1).fit(disp=False).conditional_volatility
+#         f["garch_vol"] = vol.reindex(f.index, method="ffill")
+
+#     # z‑scores
+#     for col in ["spread","imbalance","depth_imb5","of_intensity"]:
+#         f[col+"_z"] = zscore(f[col])
+
+#     return f.dropna()
+
+# # ── labels (horizon in **bars**) ──────────────────────────────────────────
+# def add_label(f: pd.DataFrame, *, bar_ms:int, horizon_bars:int,
+#               alpha: float = 0.20) -> pd.DataFrame:
+#     """
+#     3‑class label at t for ΔP over next `horizon_bars`:
+#        +1 if ΔP >  max(alpha * dyn_tick, min_tick)
+#         0 if |ΔP| ≤ threshold
+#        -1 if ΔP < -max(alpha * dyn_tick, min_tick)
+
+#     If you see only a single class after building, LOWER alpha (e.g. 0.10 or 0.05)
+#     and rebuild features for this instrument/day/horizon.
+#     """
+#     steps = int(horizon_bars)
+#     ref   = f["micropx"]
+#     tgt   = ref.shift(-steps) - ref
+
+#     # robust local movement scale
+#     dyn_tick = ref.diff().abs().rolling(100).median().bfill()
+
+#     # min tick by price regime
+#     min_tick = np.where(ref < 2.0, 0.0005, 0.001)
+
+#     thr = np.maximum(alpha * dyn_tick, min_tick)
+#     f = f.copy()
+#     f["y"] = np.select([tgt > thr, tgt < -thr], [1, -1], 0).astype(np.int8)
+#     return f.dropna()
+
+# # ── NASDAQ pipeline ───────────────────────────────────────────────────────
+# def process_nasdaq(bar_ms:int, horizon:int, snap_ms:int,
+#                    stock: Optional[str], locate: Optional[int],
+#                    alpha: float,
+#                    tod_start: str, tod_end: str, tz: str) -> tuple[Path,Path,Path]:
+
+#     if locate is not None:
+#         candidate = ITCH_DIR / f"mid_{locate}_{snap_ms}ms.parquet"
+#         tag = str(locate)
+#     elif stock:
+#         candidate = ITCH_DIR / f"mid_{stock}_{snap_ms}ms.parquet"
+#         tag = stock
+#     else:
+#         raise SystemExit("Select instrument with --stock or --locate (same as cleaning).")
+
+#     if not candidate.exists():
+#         raise FileNotFoundError(f"Snapshot file not found: {candidate}\n"
+#                                 f"Run clean_nasdaq_itch.py with the same --snap_ms and instrument.")
+
+#     df = pd.read_parquet(candidate)
+#     if "timestamp" in df and not isinstance(df.index, pd.DatetimeIndex):
+#         df = df.set_index(pd.to_datetime(df["timestamp"], utc=True)).drop(columns="timestamp")
+
+#     # resample to bar grid first
+#     bars = _ffill_resample(df, bar_ms, snap_ms)
+#     bars = bars[bars["ask_px"] > bars["bid_px"]]  # paranoia
+
+#     # NEW: time-of-day window in local market time
+#     before = len(bars)
+#     bars = _filter_time_of_day(bars, start=tod_start, end=tod_end, tz=tz)
+#     after = len(bars)
+#     print(f"⏱  kept {after:,}/{before:,} bars in [{tod_start},{tod_end}) {tz}")
+
+#     feat = make_features(bars, bar_ms=bar_ms)
+#     feat = add_label(feat, bar_ms=bar_ms, horizon_bars=horizon, alpha=alpha)
+
+#     n = len(feat)
+#     tr, va, te = feat[:int(.7*n)], feat[int(.7*n):int(.85*n)], feat[int(.85*n):]
+#     paths = [ITCH_DIR / f"nasdaq_{tag}_{bar_ms}ms_{p}.parquet" for p in ("train","val","test")]
+#     for subset, p in zip((tr,va,te), paths):
+#         p.parent.mkdir(parents=True, exist_ok=True)
+#         subset.to_parquet(p, compression="snappy")
+
+#     # diagnostics
+#     def _counts(y): 
+#         u,c = np.unique(y, return_counts=True); return dict(zip(u.tolist(), c.tolist()))
+#     print(f"✔ NASDAQ_ITCH {tag} @ {bar_ms} ms | horizon {horizon} bars | alpha {alpha} | rows {n:,}")
+#     print(f"  train label counts → {_counts(tr['y'].to_numpy())}")
+#     print(f"    val label counts → {_counts(va['y'].to_numpy())}")
+#     print(f"   test label counts → {_counts(te['y'].to_numpy())}")
+
+#     return tuple(paths)
+
+# _PIPE: Dict[str, Callable[...,object]] = {"NASDAQ_ITCH": process_nasdaq}
+
+# def main():
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--dataset", required=True, choices=_PIPE.keys())
+#     ap.add_argument("--bar_ms",  type=int, default=20)
+#     ap.add_argument("--horizon", type=int, default=50, help="Lookahead in bars (e.g., 50 bars @20ms ≈1s)")
+#     ap.add_argument("--snap_ms", type=int, default=20, help="Must match cleaning grid")
+#     ap.add_argument("--stock")
+#     ap.add_argument("--locate", type=int)
+#     ap.add_argument("--alpha", type=float, default=0.20,
+#                     help="Label threshold multiplier (lower to get fewer zeros)")
+#     # NEW: time-of-day window (local market time)
+#     ap.add_argument("--tod_start", default="09:00:00", help="Local start HH:MM[:SS]")
+#     ap.add_argument("--tod_end",   default="17:00:00", help="Local end HH:MM[:SS] (exclusive)")
+#     ap.add_argument("--tz",        default="America/New_York", help="Market timezone")
+
+#     args = ap.parse_args()
+
+#     print(f"▶ Build {args.dataset} | instrument {args.stock or args.locate} "
+#           f"@ {args.bar_ms} ms | horizon {args.horizon} bars | snap {args.snap_ms} ms | "
+#           f"alpha={args.alpha} | {args.tod_start}-{args.tod_end} {args.tz}")
+
+#     result = _PIPE[args.dataset](args.bar_ms, args.horizon, args.snap_ms,
+#                                  args.stock, args.locate,
+#                                  args.alpha, args.tod_start, args.tod_end, args.tz)
+
+#     reg_path = ITCH_DIR / "feature_registry.json"
+#     registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+#     key = f"nasdaq_itch_{args.stock or args.locate}"
+#     registry[key] = [str(p) for p in result]
+#     reg_path.write_text(json.dumps(registry, indent=2))
+#     print("✓ Registry updated:", reg_path)
+
+# if __name__ == "__main__":
+#     main()
+
+
 #!/usr/bin/env python3
-"""
-build_features.py — Phase 2 feature & label builder (robust to missing timestamps)
-
-Adds:
-  • Advanced moving averages: DEMA/TEMA/HMA/KAMA/TRIX (configurable windows)
-  • 1-second GARCH(1,1) conditional volatility (resampled to original grid)
-  • Centralized label generation with tunable alpha:
-      - abs:      y = -1 if r <= -alpha; +1 if r >= +alpha; else 0
-      - quantile: alpha from TRAIN abs-return tail so only top |r| fraction is ±1
-
-CLI stays identical to prior version.
-"""
-
+# Build bar‑level features & labels for one NASDAQ instrument.
 from __future__ import annotations
-import argparse, os
+import argparse, json, math, warnings, re
 from pathlib import Path
-from typing import Tuple
-
+from typing import Dict, Callable, Optional, Tuple
 import numpy as np
 import pandas as pd
+import numba as nb
+from arch import arch_model
 
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers for robustness (timestamps + mid detection)
-# ─────────────────────────────────────────────────────────────────────────────
+ROOT     = Path(__file__).resolve().parents[1]
+ITCH_DIR = ROOT / "data" / "processed" / "NASDAQ_ITCH"
+ITCH_DIR.mkdir(parents=True, exist_ok=True)
 
-# def ensure_timestamp(df: pd.DataFrame, bar_ms: int, ts_col: str = "timestamp") -> pd.DataFrame:
-#     """
-#     Guarantee a UTC 'timestamp' column for sorting/resample. If missing/unparsable,
-#     synthesize a monotonic timeline from row order (bar_ms). Keeps prior behavior if present.
-#     """
-#     df = df.copy()
-#     ts = None
-#     if ts_col in df.columns:
-#         ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-#         if ts.isna().all():  # fully unparsable → synthesize
-#             ts = None
-#     elif isinstance(df.index, pd.DatetimeIndex):
-#         ts = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
+# ── helpers ───────────────────────────────────────────────────────────────
+@nb.njit(cache=True)
+def _wma(arr: np.ndarray, n: int) -> np.ndarray:
+    out = np.empty_like(arr)
+    w   = np.arange(1, n+1, dtype=arr.dtype); ws = w.sum()
+    for i in range(arr.shape[0]):
+        out[i] = np.nan if i < n-1 else (arr[i-n+1:i+1]*w).sum()/ws
+    return out
 
-#     if ts is None:
-#         base = pd.Timestamp("1970-01-01", tz="UTC")
-#         ts = base + pd.to_timedelta(np.arange(len(df)) * int(bar_ms), unit="ms")
+def ema(s: pd.Series, n:int) -> pd.Series:  return s.ewm(span=n, adjust=False).mean()
+def dema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); return 2*e1-ema(e1,n)
+def tema(s: pd.Series, n:int) -> pd.Series: e1=ema(s,n); e2=ema(e1,n); e3=ema(e2,n); return 3*e1-3*e2+e3
+def hma (s: pd.Series, n:int) -> pd.Series:
+    half, root = int(n/2), int(math.sqrt(n))
+    return pd.Series(_wma(2*_wma(s.values, half) - _wma(s.values, n), root), index=s.index)
 
-#     df[ts_col] = pd.DatetimeIndex(ts)
-#     return df.sort_values(ts_col).reset_index(drop=True)
-def ensure_timestamp(df: pd.DataFrame, bar_ms: int, ts_col: str = "timestamp") -> pd.DataFrame:
-    """
-    Guarantee a UTC 'timestamp' column for sorting/resample. If missing/unparsable,
-    synthesize a monotonic timeline from row order (bar_ms).
-    Robust to cases where 'timestamp' is both an index level and a column.
-    """
-    df = df.copy()
+def kama(price: pd.Series, er_period=10, fast=2, slow=30) -> pd.Series:
+    if len(price) == 0:
+        return price.copy()
+    change = price.diff(er_period).abs()
+    vol    = price.diff().abs().rolling(er_period).sum()
+    er     = (change / vol).fillna(0)
+    sc     = (er*(2/(fast+1)-2/(slow+1)) + 2/(slow+1))**2
+    out = pd.Series(index=price.index, dtype=float)
+    out.iloc[0] = price.iloc[0]
+    for i in range(1, len(price)):
+        out.iloc[i] = out.iloc[i-1] + sc.iloc[i]*(price.iloc[i]-out.iloc[i-1])
+    return out
 
-    # 1) Pull/create a proper UTC time vector *before* touching the index
-    ts = None
-    if ts_col in df.columns:
-        ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-        if ts.isna().all():
-            ts = None
-    elif isinstance(df.index, pd.DatetimeIndex):
-        ts = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
-
-    if ts is None:
-        base = pd.Timestamp("1970-01-01", tz="UTC")
-        step_ms = max(int(bar_ms), 1)
-        ts = base + pd.to_timedelta(np.arange(len(df)) * step_ms, unit="ms")
-
-    # 2) Nuke any possibility of name collision: drop index to a clean RangeIndex
-    df.index = pd.RangeIndex(len(df))  # removes names/levels entirely
-
-    # 3) Sort by a temporary unique column, then commit to 'timestamp'
-    tmp = "__ts__"
-    df[tmp] = pd.DatetimeIndex(ts)
-    df.sort_values(tmp, inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    df[ts_col] = df[tmp]
-    df.drop(columns=[tmp], inplace=True)
-
-    return df
-
-
-def auto_mid_col(df: pd.DataFrame, preferred: str = "mid_px") -> str:
-    """Pick a sensible mid-price column if the preferred one is missing."""
-    candidates = [preferred, "mid_px", "mid", "mid_price", "midprice", "midpoint"]
-    for c in dict.fromkeys(candidates):
-        if c in df.columns:
-            return c
-    raise SystemExit(f"Mid-price column not found. Tried: {candidates}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Indicators
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False, min_periods=span).mean()
-
-def dema(s: pd.Series, span: int) -> pd.Series:
-    e1 = ema(s, span)
-    e2 = ema(e1, span)
-    return 2.0 * e1 - e2
-
-def tema(s: pd.Series, span: int) -> pd.Series:
-    e1 = ema(s, span)
-    e2 = ema(e1, span)
-    e3 = ema(e2, span)
-    return 3.0 * (e1 - e2) + e3
-
-def wma(s: pd.Series, window: int) -> pd.Series:
-    if window <= 1:
+def zscore(s: pd.Series, win=500) -> pd.Series:
+    if len(s) == 0:
         return s.copy()
-    w = np.arange(1, window + 1, dtype=float)
-    w /= w.sum()
-    return s.rolling(window, min_periods=window).apply(lambda x: np.dot(w, x), raw=True)
+    mu = s.rolling(win).mean() if len(s)>=win else s.expanding().mean()
+    sd = s.rolling(win).std()  if len(s)>=win else s.expanding().std()
+    sd = sd.replace(0, 1e-9)
+    return (s - mu) / sd
 
-def hma(s: pd.Series, window: int) -> pd.Series:
-    # HMA(n) = WMA( 2*WMA(P, n/2) - WMA(P, n), sqrt(n) )
-    n = max(int(window), 1)
-    n2 = max(int(round(n / 2)), 1)
-    n_sqrt = max(int(np.sqrt(n)), 1)
-    wma_n  = wma(s, n)
-    wma_n2 = wma(s, n2)
-    tmp = 2.0 * wma_n2 - wma_n
-    return wma(tmp, n_sqrt)
-
-def kama(s: pd.Series, er_window: int = 10, fast: int = 2, slow: int = 30) -> pd.Series:
-    # Kaufman Adaptive Moving Average (ER-based)
-    fast_sc = 2.0 / (fast + 1.0)
-    slow_sc = 2.0 / (slow + 1.0)
-    out = np.full(len(s), np.nan, dtype=np.float64)
-    s_np = s.to_numpy(dtype=np.float64)
-    if len(s_np) < er_window + 2:
-        return pd.Series(out, index=s.index)
-    out[er_window] = np.nanmean(s_np[:er_window])  # seed
-    for t in range(er_window + 1, len(s_np)):
-        change = abs(s_np[t] - s_np[t - er_window])
-        vol = np.sum(np.abs(np.diff(s_np[t - er_window:t + 1])))
-        er = (change / vol) if vol > 0 else 0.0
-        sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
-        out[t] = out[t - 1] + sc * (s_np[t] - out[t - 1])
-    return pd.Series(out, index=s.index)
-
-def trix(s: pd.Series, span: int = 15) -> pd.Series:
-    # TRIX: 1‑period diff of triple‑smoothed EMA of log price
-    logp = np.log(s.replace(0, np.nan))
-    e1 = ema(logp, span)
-    e2 = ema(e1, span)
-    e3 = ema(e2, span)
-    return e3.diff()
-
-def garch_vol_1s(mid: pd.Series,
-                 omega: float = 1e-6, alpha: float = 0.05, beta: float = 0.90,
-                 min_points: int = 30) -> pd.Series:
-    """Compute GARCH(1,1) conditional vol on 1-second log returns; upsample to the original grid."""
-    if mid.isna().all():
-        return pd.Series(np.nan, index=mid.index)
-    mid_1s = mid.resample("1S").last().dropna()
-    r = np.log(mid_1s).diff().dropna()
-    if len(r) < min_points:
-        return pd.Series(np.nan, index=mid.index)
-    var = np.empty(len(r), dtype=np.float64)
-    var[0] = r.var() if np.isfinite(r.var()) else 1e-6
-    for t in range(1, len(r)):
-        var[t] = omega + alpha * (r.iloc[t - 1] ** 2) + beta * var[t - 1]
-    vol_1s = pd.Series(np.sqrt(var), index=r.index)
-    return vol_1s.reindex(mid.index, method="ffill")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Labeling
-# ─────────────────────────────────────────────────────────────────────────────
-
-def forward_return(mid: pd.Series, horizon_steps: int) -> pd.Series:
-    return (mid.shift(-horizon_steps) - mid) / mid
-
-def label_by_alpha(ret_fwd: pd.Series, alpha: float) -> pd.Series:
-    y = np.zeros(len(ret_fwd), dtype=np.int8)
-    y[ret_fwd >= alpha]  = 1
-    y[ret_fwd <= -alpha] = -1
-    return pd.Series(y, index=ret_fwd.index)
-
-def calibrate_alpha_from_quantile(abs_rets_train: pd.Series, target_tail_frac: float) -> float:
-    # If target_tail_frac = 0.01, ~1% of samples have |r| >= alpha (≈ half up, half down).
-    q = 1.0 - float(target_tail_frac)
-    q = min(max(q, 0.50), 0.999999)
-    return float(abs_rets_train.quantile(q))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core feature pipeline
-# ─────────────────────────────────────────────────────────────────────────────
-
-def add_indicators(df: pd.DataFrame,
-                   mid_col: str,
-                   *,
-                   bar_ms: int,
-                   fast_ms: int,
-                   slow_ms: int,
-                   trix_ms: int,
-                   kama_window: int = 10) -> pd.DataFrame:
-    df = ensure_timestamp(df.copy(), bar_ms)
-    df[mid_col] = df[mid_col].astype("float64")
-
-    def ms_to_n(ms: int) -> int:
-        return max(int(round(ms / max(bar_ms, 1))), 1)
-
-    n_fast = ms_to_n(fast_ms)
-    n_slow = ms_to_n(slow_ms)
-    n_trix = ms_to_n(trix_ms)
-
-    px = df[mid_col]
-    df[f"dema_{fast_ms}ms"] = dema(px, n_fast)
-    df[f"dema_{slow_ms}ms"] = dema(px, n_slow)
-    df[f"tema_{fast_ms}ms"] = tema(px, n_fast)
-    df[f"tema_{slow_ms}ms"] = tema(px, n_slow)
-    df[f"hma_{fast_ms}ms"]  = hma(px, n_fast)
-    df[f"hma_{slow_ms}ms"]  = hma(px, n_slow)
-    df[f"kama_{kama_window}"] = kama(px, er_window=kama_window, fast=2, slow=30)
-    df[f"trix_{trix_ms}ms"] = trix(px, n_trix)
-
-    # 1s GARCH vol (needs DatetimeIndex)
-    df = df.set_index("timestamp")
-    df["garch_vol_1s"] = garch_vol_1s(df[mid_col])
-    df = df.reset_index()
-
-    return df
-
-
-def build_one_split(df_in: pd.DataFrame,
-                    *,
-                    mid_col: str,
-                    bar_ms: int,
-                    fast_ms: int,
-                    slow_ms: int,
-                    trix_ms: int,
-                    kama_window: int,
-                    horizon_steps: int,
-                    alpha: float) -> pd.DataFrame:
-    df = ensure_timestamp(df_in.copy(), bar_ms)
-
-    # indicators
-    df = add_indicators(df, mid_col, bar_ms=bar_ms,
-                        fast_ms=fast_ms, slow_ms=slow_ms, trix_ms=trix_ms,
-                        kama_window=kama_window)
-
-    # forward return + labels
-    df = df.set_index("timestamp")
-    r_fwd = forward_return(df[mid_col], horizon_steps=horizon_steps)
-    y = label_by_alpha(r_fwd, alpha)
-    df["y"] = y.astype(np.int8)
-
-    # back to columns + light types
-    df = df.reset_index()
+def _ffill_resample(df: pd.DataFrame, bar_ms:int, snap_ms:int) -> pd.DataFrame:
+    """Bring snapshots to exact bar grid with controlled ffill gap."""
+    limit = max(1, math.ceil(snap_ms / bar_ms))
+    def is_px(c:str) -> bool: return c.endswith("_px") or "_px_" in c or c in ("bid_px","ask_px")
+    def is_sz(c:str) -> bool: return c.endswith("_sz") or "_sz_" in c or c.endswith("sz1")
+    agg_map = {}
     for c in df.columns:
-        if c == "y": continue
-        if pd.api.types.is_float_dtype(df[c]):
-            df[c] = df[c].astype(np.float32)
-    return df
+        if is_px(c):   agg_map[c] = "last"
+        elif is_sz(c): agg_map[c] = "mean"
+        else:          agg_map[c] = "last"
+    out = df.resample(f"{bar_ms}ms").agg(agg_map).ffill(limit=limit)
+    return out
 
+# ── features ───────────────────────────────────────────────────────────────
+def make_features(df: pd.DataFrame, *, bar_ms:int) -> pd.DataFrame:
+    need = {"mid_px","microprice","spread","imbalance","last_trade_px","cum_vol",
+            "bid_sz1","ask_sz1","ask_px","bid_px"}
+    miss = need - set(df.columns)
+    if miss:
+        raise KeyError(f"Cleaner must provide columns: {miss}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI / IO
-# ─────────────────────────────────────────────────────────────────────────────
+    # Drop crossed books just in case (ask<=bid)
+    df = df[df["ask_px"] > df["bid_px"]].copy()
 
-def _load(fp: str) -> pd.DataFrame:
-    if fp is None: return None
-    return pd.read_parquet(fp)
+    f = pd.DataFrame(index=df.index)
+    f["mid_px"]    = df["mid_px"]
+    f["micropx"]   = df["microprice"]
+    f["spread"]    = df["spread"]
+    f["imbalance"] = df["imbalance"]
+    f["ret_mid"]   = f["mid_px"].pct_change(fill_method=None).fillna(0)
+    f["ret_micro"] = f["micropx"].pct_change(fill_method=None).fillna(0)
+    f["log_ret"]   = np.log(f["mid_px"]).diff().fillna(0)
 
-def _save(df: pd.DataFrame, fp_out: str):
-    Path(fp_out).parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(fp_out, compression="snappy")
-    print("✔ wrote", fp_out, f"rows={len(df):,}")
+    # depth (L1..L5 sums & shapes)
+    bid_depth_cols = [c for c in df.columns if re.match(r"^bid_sz(_\d+)?$", c)]
+    ask_depth_cols = [c for c in df.columns if re.match(r"^ask_sz(_\d+)?$", c)]
+    bid_depth = df[bid_depth_cols].fillna(0).to_numpy()
+    ask_depth = df[ask_depth_cols].fillna(0).to_numpy()
+    f["depth_bid_L5"] = bid_depth.sum(1)
+    f["depth_ask_L5"] = ask_depth.sum(1)
+    f["depth_imb5"]   = (f["depth_bid_L5"] - f["depth_ask_L5"]) / \
+                        (f["depth_bid_L5"] + f["depth_ask_L5"] + 1e-9)
+    f["q_iratio"] = df["bid_sz1"] / (df["bid_sz1"] + df["ask_sz1"] + 1e-9)
+    f["depth_slope_bid"] = (df["bid_sz1"] - df.get("bid_sz_5", df["bid_sz1"])) / 4
+    f["depth_slope_ask"] = (df["ask_sz1"] - df.get("ask_sz_5", df["ask_sz1"])) / 4
+
+    # order‑flow
+    trade_px = df["last_trade_px"].replace(0, np.nan).ffill()
+    f["trade_dir"] = np.sign(trade_px - f["mid_px"]).fillna(0)
+    vol_deltas = df["cum_vol"].diff().fillna(0)
+    intensity_n = max(5, int(1000/bar_ms))
+    f["of_intensity"] = vol_deltas.rolling(intensity_n).mean().fillna(0)
+    f["trade_gap"]    = (trade_px - f["micropx"]).fillna(0)
+
+    # volatility proxies
+    atr_n = max(3, int(1000/bar_ms))
+    rng   = f["mid_px"].rolling(atr_n).max() - f["mid_px"].rolling(atr_n).min()
+    f["atr_fast"] = (rng / f["mid_px"]).fillna(method="bfill")
+
+    n_fast = max(4, int( 800 / bar_ms))
+    n_slow = max(8, int(2400 / bar_ms))
+    f["dema_f"] = dema(f["micropx"], n_fast)
+    f["dema_s"] = dema(f["micropx"], n_slow)
+    f["tema_f"] = tema(f["micropx"], n_fast)
+    f["hma16"]  = hma (f["micropx"], 16)
+    f["kama"]   = kama(f["micropx"])
+
+    n_trix = max(5, int(1500/bar_ms))
+    ema1 = ema(f["micropx"], n_trix); ema2 = ema(ema1, n_trix); ema3 = ema(ema2, n_trix)
+    f["trix"] = (ema3 / ema3.shift(1) - 1).fillna(0) * 100
+
+    # GARCH on 1‑second returns (optional, ffill to bar grid)
+    f["garch_vol"] = np.nan
+    r1s = f["micropx"].resample("1s").last().pct_change().dropna() * 100
+    if len(r1s) > 300:
+        vol = arch_model(r1s, p=1, q=1).fit(disp=False).conditional_volatility
+        f["garch_vol"] = vol.reindex(f.index, method="ffill")
+
+    # z‑scores
+    for col in ["spread","imbalance","depth_imb5","of_intensity"]:
+        f[col+"_z"] = zscore(f[col])
+
+    return f.dropna()
+
+# ── labels (horizon in **bars**) ──────────────────────────────────────────
+def add_label(f: pd.DataFrame, *, bar_ms:int, horizon_bars:int,
+              alpha: float = 0.20) -> pd.DataFrame:
+    """
+    3‑class label at t for ΔP over next `horizon_bars`:
+       +1 if ΔP >  max(alpha * dyn_tick, min_tick)
+        0 if |ΔP| ≤ threshold
+       -1 if ΔP < -max(alpha * dyn_tick, min_tick)
+    dyn_tick = rolling median |ΔP(1 bar)|.
+    """
+    steps = int(horizon_bars)
+    ref   = f["micropx"]
+    tgt   = ref.shift(-steps) - ref
+
+    # robust local movement scale
+    dyn_tick = ref.diff().abs().rolling(100).median().bfill()
+
+    # min tick by price regime
+    min_tick = np.where(ref < 2.0, 0.0005, 0.001)
+
+    thr = np.maximum(alpha * dyn_tick, min_tick)
+    f = f.copy()
+    f["y"] = np.select([tgt > thr, tgt < -thr], [1, -1], 0).astype(np.int8)
+    return f.dropna()
+
+# ── NASDAQ pipeline ───────────────────────────────────────────────────────
+def _load_mid(snap_ms:int, stock: Optional[str], locate: Optional[int]) -> Tuple[pd.DataFrame, str]:
+    if locate is not None:
+        candidate = ITCH_DIR / f"mid_{locate}_{snap_ms}ms.parquet"
+        tag = str(locate)
+    elif stock:
+        candidate = ITCH_DIR / f"mid_{stock}_{snap_ms}ms.parquet"
+        tag = stock
+    else:
+        raise SystemExit("Select instrument with --stock or --locate (same as cleaning).")
+
+    if not candidate.exists():
+        raise FileNotFoundError(f"Snapshot file not found: {candidate}\n"
+                                f"Run clean_nasdaq_itch.py with the same --snap_ms and instrument.")
+    df = pd.read_parquet(candidate)
+    if "timestamp" in df and not isinstance(df.index, pd.DatetimeIndex):
+        df = df.set_index(pd.to_datetime(df["timestamp"], utc=True)).drop(columns="timestamp")
+    return df, tag
+
+def process_nasdaq(bar_ms:int, horizon:int, snap_ms:int,
+                   stock: Optional[str], locate: Optional[int],
+                   alpha: float, tail_frac: float) -> tuple[Path,Path,Path]:
+    df, tag = _load_mid(snap_ms, stock, locate)
+
+    bars = _ffill_resample(df, bar_ms, snap_ms)
+    bars = bars[bars["ask_px"] > bars["bid_px"]]  # paranoia
+
+    feat = make_features(bars, bar_ms=bar_ms)
+    feat = add_label(feat, bar_ms=bar_ms, horizon_bars=horizon, alpha=alpha)  # horizon in BARS
+
+    # drop the last tail_frac (e.g., 0.15 = last 15% of the day)
+    n_all = len(feat)
+    keep_n = int((1.0 - max(0.0, min(0.999, tail_frac))) * n_all)
+    feat = feat.iloc[:keep_n].copy()
+    print(f"⏱  kept {len(feat):,}/{n_all:,} bars in the first {int((1-tail_frac)*100)}% of the day")
+
+    # chronological split inside the kept window: 70/15/15
+    n = len(feat)
+    i1, i2 = int(.70*n), int(.85*n)
+    tr, va, te = feat.iloc[:i1], feat.iloc[i1:i2], feat.iloc[i2:]
+
+    def _counts(name, y):
+        u, c = np.unique(y, return_counts=True)
+        print(f"  {name:5s} label counts → " + str({int(k): int(v) for k, v in zip(u, c)}))
+
+    _counts("train", tr["y"].to_numpy())
+    _counts("val",   va["y"].to_numpy())
+    _counts("test",  te["y"].to_numpy())
+
+    paths = [ITCH_DIR / f"nasdaq_{tag}_{bar_ms}ms_{p}.parquet" for p in ("train","val","test")]
+    for subset, p in zip((tr,va,te), paths):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        subset.to_parquet(p, compression="snappy")
+    print(f"✔ NASDAQ_ITCH {tag} @ {bar_ms} ms | horizon {horizon} bars | alpha {alpha} | rows {n:,}")
+    return tuple(paths)
+
+_PIPE: Dict[str, Callable[...,object]] = {"NASDAQ_ITCH": process_nasdaq}
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train", required=True, help="train parquet path")
-    ap.add_argument("--val",   required=True, help="val parquet path")
-    ap.add_argument("--test",  required=True, help="test parquet path")
-    ap.add_argument("--out_tag", default="", help="optional suffix for outputs (e.g., _v2). If empty, overwrite in place.")
-
-    # grid & horizons
-    ap.add_argument("--bar_ms", type=int, default=10, help="bar size in milliseconds (e.g., 10 for 10ms grid)")
-    ap.add_argument("--horizon_steps", type=int, default=1, help="forward steps for labeling (on the bar grid)")
-
-    # indicator params in milliseconds (converted to bar counts internally)
-    ap.add_argument("--fast_ms", type=int, default=50,  help="fast MA window in ms")
-    ap.add_argument("--slow_ms", type=int, default=200, help="slow MA window in ms")
-    ap.add_argument("--trix_ms", type=int, default=150, help="TRIX EMA span in ms")
-    ap.add_argument("--kama_n", type=int, default=10,   help="KAMA efficiency-ratio window (bars)")
-
-    # labeling
-    ap.add_argument("--alpha_mode", choices=["abs", "quantile"], default="abs",
-                    help="'abs' uses a fixed alpha; 'quantile' learns alpha from TRAIN abs-return tail.")
-    ap.add_argument("--alpha", type=float, default=0.0005, help="abs mode: threshold on fwd return (e.g., 5 bps = 0.0005)")
-    ap.add_argument("--target_tail_frac", type=float, default=0.01,
-                    help="quantile mode: fraction of TRAIN samples labeled ±1 in total (≈1% gives ~0.5% up/down)")
-
-    ap.add_argument("--mid_col", default="mid_px", help="mid-price column name")
+    ap.add_argument("--dataset", required=True, choices=_PIPE.keys())
+    ap.add_argument("--bar_ms",  type=int, default=20)
+    ap.add_argument("--horizon", type=int, default=50, help="Lookahead in bars (e.g., 50 bars @20ms ≈1s)")
+    ap.add_argument("--snap_ms", type=int, default=20, help="Must match cleaning grid")
+    ap.add_argument("--stock")
+    ap.add_argument("--locate", type=int)
+    ap.add_argument("--alpha", type=float, default=0.20, help="Move threshold scale; lower ⇒ fewer 0s")
+    ap.add_argument("--tail_frac", type=float, default=0.15, help="Drop last fraction of the day")
     args = ap.parse_args()
 
-    tr, va, te = _load(args.train), _load(args.val), _load(args.test)
-    if tr is None or va is None or te is None:
-        raise SystemExit("Failed to load one or more input files.")
+    print(f"▶ Build {args.dataset} | instrument {args.stock or args.locate} "
+          f"@ {args.bar_ms} ms | horizon {args.horizon} bars | snap {args.snap_ms} ms | "
+          f"alpha={args.alpha} | drop_last={int(args.tail_frac*100)}%")
 
-    # Ensure timestamps + mid col before calibrating alpha
-    tr = ensure_timestamp(tr, args.bar_ms); va = ensure_timestamp(va, args.bar_ms); te = ensure_timestamp(te, args.bar_ms)
-    mid_col = args.mid_col if args.mid_col in tr.columns else auto_mid_col(tr, args.mid_col)
-    if mid_col != args.mid_col:
-        print(f"[mid_col] '{args.mid_col}' not found. Using '{mid_col}'.")
+    result = _PIPE[args.dataset](args.bar_ms, args.horizon, args.snap_ms,
+                                 args.stock, args.locate, args.alpha, args.tail_frac)
 
-    # Compute TRAIN forward return to calibrate quantile alpha if needed
-    tr_ret = forward_return(tr.set_index("timestamp")[mid_col], args.horizon_steps)
-
-    if args.alpha_mode == "quantile":
-        abs_ret = tr_ret.abs().dropna()
-        if len(abs_ret) == 0:
-            raise SystemExit("Cannot calibrate alpha: TRAIN forward returns are empty.")
-        alpha = calibrate_alpha_from_quantile(abs_ret, args.target_tail_frac)
-        print(f"[labels] quantile mode: target_tail_frac={args.target_tail_frac} → alpha={alpha:.6g}")
-    else:
-        alpha = float(args.alpha)
-        print(f"[labels] abs mode: alpha={alpha:.6g}")
-
-    # Build each split
-    def _outpath(in_path: str) -> str:
-        if args.out_tag:
-            b, ext = os.path.splitext(in_path)
-            return f"{b}{args.out_tag}{ext}"
-        return in_path
-
-    print("[features] generating indicators and labels …")
-    tr_out = build_one_split(tr, mid_col=mid_col, bar_ms=args.bar_ms,
-                             fast_ms=args.fast_ms, slow_ms=args.slow_ms, trix_ms=args.trix_ms,
-                             kama_window=args.kama_n, horizon_steps=args.horizon_steps, alpha=alpha)
-    va_out = build_one_split(va, mid_col=mid_col, bar_ms=args.bar_ms,
-                             fast_ms=args.fast_ms, slow_ms=args.slow_ms, trix_ms=args.trix_ms,
-                             kama_window=args.kama_n, horizon_steps=args.horizon_steps, alpha=alpha)
-    te_out = build_one_split(te, mid_col=mid_col, bar_ms=args.bar_ms,
-                             fast_ms=args.fast_ms, slow_ms=args.slow_ms, trix_ms=args.trix_ms,
-                             kama_window=args.kama_n, horizon_steps=args.horizon_steps, alpha=alpha)
-
-    # quick label diagnostics
-    def _dist(y: pd.Series) -> dict:
-        u, c = np.unique(y.dropna().astype(int), return_counts=True)
-        return {int(i): int(j) for i, j in zip(u, c)}
-    print("label distribution (train):", _dist(tr_out["y"]))
-    print("label distribution (val):  ", _dist(va_out["y"]))
-    print("label distribution (test): ", _dist(te_out["y"]))
-
-    # Save
-    _save(tr_out, _outpath(args.train))
-    _save(va_out, _outpath(args.val))
-    _save(te_out, _outpath(args.test))
+    reg_path = ITCH_DIR / "feature_registry.json"
+    registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+    key = f"nasdaq_itch_{args.stock or args.locate}"
+    registry[key] = [str(p) for p in result]
+    reg_path.write_text(json.dumps(registry, indent=2))
+    print("✓ Registry updated:", reg_path)
 
 if __name__ == "__main__":
     main()

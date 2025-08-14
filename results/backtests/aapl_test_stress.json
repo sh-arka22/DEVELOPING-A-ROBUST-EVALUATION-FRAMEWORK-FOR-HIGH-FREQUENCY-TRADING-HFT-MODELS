@@ -1,0 +1,16 @@
+{
+  "scale": {
+    "Sharpe": 0.0,
+    "Sortino": 0.0,
+    "MDD": 0.0,
+    "VaR95": 0.0,
+    "ES95": 0.0
+  },
+  "dropout": {
+    "Sharpe": 0.0,
+    "Sortino": 0.0,
+    "MDD": 0.0,
+    "VaR95": 0.0,
+    "ES95": 0.0
+  }
+}

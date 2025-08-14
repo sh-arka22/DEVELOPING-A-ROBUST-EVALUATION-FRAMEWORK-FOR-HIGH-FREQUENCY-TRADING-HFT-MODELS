@@ -1,3 +1,4 @@
+# filepath: /Users/arkajyotisaha/Desktop/My-Thesis/code/src/utils/data_utils.py -->
 # #!/usr/bin/env python3
 # """
 # Utility helpers for the HFT pipeline
@@ -221,33 +222,6 @@ import pandas as pd
 
 NUMERIC_ONLY = ["number", "bool"]  # keep numeric + flags
 
-# def load_features_labels(
-#     parquet_file: str,
-#     label_col: str = "y",
-#     drop_cols: List[str] | str | None = "timestamp",
-# ) -> tuple[pd.DataFrame, np.ndarray]:
-#     df = pd.read_parquet(parquet_file)
-
-#     # keep order by time if available
-#     if drop_cols:
-#         if isinstance(drop_cols, str):
-#             drop_cols = [drop_cols]
-#         for col in drop_cols:
-#             if col in df.columns:
-#                 df = df.sort_values(col)
-#                 break
-
-#     if label_col not in df.columns:
-#         raise KeyError(f"Label column '{label_col}' not found in {parquet_file}")
-
-#     y = df[label_col].to_numpy(copy=True)
-
-#     cols_to_drop = [label_col] + ([*drop_cols] if drop_cols else [])
-#     feat_df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
-
-#     # numeric/bool features only, preserve original order
-#     feat_df = feat_df.select_dtypes(include=NUMERIC_ONLY).copy()
-#     return feat_df, y
 def load_features_labels(
     parquet_file: str,
     label_col: str = "y",
@@ -255,30 +229,12 @@ def load_features_labels(
 ) -> tuple[pd.DataFrame, np.ndarray]:
     df = pd.read_parquet(parquet_file)
 
-    # De-conflict: if the index is named like a drop/ordering column (e.g., 'timestamp'),
-    # strip the index name so sort_values() is unambiguous.
-    if isinstance(df.index, pd.MultiIndex):
-        if drop_cols:
-            names = df.index.names
-            if isinstance(drop_cols, str):
-                drop_cols = [drop_cols]
-            df = df.rename_axis([None if n in drop_cols else n for n in names])
-    else:
-        if drop_cols:
-            if isinstance(drop_cols, str):
-                drop_cols = [drop_cols]
-            if df.index.name in drop_cols:
-                df.index = pd.RangeIndex(len(df))
-
-    # Keep order by time if available
+    # keep order by time if available
     if drop_cols:
         if isinstance(drop_cols, str):
             drop_cols = [drop_cols]
         for col in drop_cols:
             if col in df.columns:
-                # ensure datetime dtype if it's 'timestamp'
-                if col.lower().startswith("time"):
-                    df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
                 df = df.sort_values(col)
                 break
 
@@ -291,7 +247,7 @@ def load_features_labels(
     feat_df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
 
     # numeric/bool features only, preserve original order
-    feat_df = feat_df.select_dtypes(include=["number", "bool"]).copy()
+    feat_df = feat_df.select_dtypes(include=NUMERIC_ONLY).copy()
     return feat_df, y
 
 def scale_features(
@@ -336,32 +292,6 @@ def create_sequences(
     y_seq = y[seq_length-1:]
     return X_seq, y_seq
 
-# def compute_class_weights(
-#     y: np.ndarray,
-#     *,
-#     cap: float = 5.0,
-#     floor: float = 1.0,
-#     power: float = 1.0,
-#     normalize: bool = True,
-# ) -> Dict[int, float]:
-#     """
-#     Inverse-frequency weights with safety cap.
-#       base: w_k = (N / (K * n_k)) ** power
-#       then: clip to [floor, cap]
-#       normalize so average weight ≈ 1 (optional)
-#     """
-#     counts = Counter(y.tolist())
-#     K = max(1, len(counts))
-#     N = float(len(y))
-#     w = {int(k): float((N / (K * cnt)) ** power) for k, cnt in counts.items()}
-#     # clip
-#     for k in w:
-#         w[k] = float(np.clip(w[k], floor, cap))
-#     if normalize:
-#         mean_w = float(np.mean(list(w.values())))
-#         for k in w:
-#             w[k] = w[k] / (mean_w if mean_w > 0 else 1.0)
-#     return w
 def compute_class_weights(
     y: np.ndarray,
     *,
@@ -374,17 +304,17 @@ def compute_class_weights(
     Inverse-frequency weights with safety cap.
       base: w_k = (N / (K * n_k)) ** power
       then: clip to [floor, cap]
-      optionally normalize so average weight ≈ 1
+      normalize so average weight ≈ 1 (optional)
     """
     counts = Counter(y.tolist())
     K = max(1, len(counts))
     N = float(len(y))
     w = {int(k): float((N / (K * cnt)) ** power) for k, cnt in counts.items()}
+    # clip
     for k in w:
         w[k] = float(np.clip(w[k], floor, cap))
     if normalize:
         mean_w = float(np.mean(list(w.values())))
-        if mean_w > 0:
-            for k in w:
-                w[k] = w[k] / (mean_w if mean_w > 0 else 1.0)
+        for k in w:
+            w[k] = w[k] / (mean_w if mean_w > 0 else 1.0)
     return w

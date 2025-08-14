@@ -1,12 +1,12 @@
 {
   "symbol": "AAPL",
   "locate": 13,
-  "trade_day": "2025-08-12",
+  "trade_day": "2025-08-14",
   "snap_ms": 10,
   "drop_crossed": false,
   "shape_feats": true,
   "crossed_kept": 5726069,
   "crossed_dropped": 0,
   "rows_written": 5760009,
-  "clean_commit": "12a38b0a"
+  "clean_commit": "6e6a9b80"
 }

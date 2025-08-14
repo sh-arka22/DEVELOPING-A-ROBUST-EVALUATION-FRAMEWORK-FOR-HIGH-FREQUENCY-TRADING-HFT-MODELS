@@ -1,3 +1,4 @@
+# filepath: /Users/arkajyotisaha/Desktop/My-Thesis/code/src/data/week1_setup.py -->
 # File: code/src/data/week1_setup.py
 # Week 1 Setup: folders, dataset configs, HDF5 detection, and initial inspection
 
